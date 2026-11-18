@@ -50,11 +50,18 @@ fn bearer_ok(app: &App, headers: &HeaderMap) -> bool {
     let Some(expected) = app.admin_token.as_ref() else {
         return false;
     };
-    headers
+    // The auth *scheme* is case-insensitive per HTTP, but the token itself
+    // must match exactly.
+    let Some(value) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.eq_ignore_ascii_case(&format!("Bearer {expected}")))
-        .unwrap_or(false)
+    else {
+        return false;
+    };
+    match value.split_once(' ') {
+        Some((scheme, token)) => scheme.eq_ignore_ascii_case("bearer") && token == expected,
+        None => false,
+    }
 }
 
 fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -78,6 +85,11 @@ async fn dash_authed(app: &App, headers: &HeaderMap) -> bool {
         return false;
     };
     let mut sessions = app.dash_sessions.lock().await;
+    // Cheap opportunistic sweep so abandoned sessions can't accumulate.
+    if sessions.len() > 64 {
+        let cutoff = now();
+        sessions.retain(|_, exp| *exp > cutoff);
+    }
     match sessions.get(&token) {
         Some(expiry) if *expiry > now() => true,
         Some(_) => {
@@ -98,8 +110,11 @@ pub async fn admin_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Resp
         return Html(rendered_dashboard()).into_response();
     }
     if !discord_configured(&app) {
-        // Not set up yet (or bearer-only mode): a friendly setup page
-        // instead of bouncing to a login that can never succeed.
+        // Setup instructions are fine on a bare LAN dev server, but if an
+        // admin token policy exists, strangers get nothing at all.
+        if app.admin_token.is_some() && !bearer_ok(&app, &headers) {
+            return not_found();
+        }
         return Html(SETUP_HTML).into_response();
     }
 
@@ -107,6 +122,10 @@ pub async fn admin_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Resp
     let state = uuid::Uuid::new_v4().to_string();
     {
         let mut states = app.oauth_states.lock().await;
+        if states.len() > 64 {
+            let cutoff = now() + STATE_TTL;
+            states.retain(|_, exp| *exp > cutoff);
+        }
         states.insert(state.clone(), now() + STATE_TTL);
     }
     let client_id = app.discord_client_id.clone().unwrap_or_default();
@@ -206,20 +225,27 @@ pub async fn oauth_callback(
             .into_response();
     }
 
-    // Issue a session cookie.
+    // Issue a session cookie. SameSite always; Secure when the operator
+    // tells us we're behind TLS (the tunnel phase sets this).
     let token = uuid::Uuid::new_v4().to_string();
     app.dash_sessions
         .lock()
         .await
         .insert(token.clone(), now() + SESSION_TTL);
+    let secure = std::env::var("BURROW_SECURE_COOKIES")
+        .map(|v| matches!(v.trim(), "1" | "true"))
+        .unwrap_or(false);
+    let mut cookie = format!(
+        "burrow_session={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
+        token, SESSION_TTL
+    );
+    if secure {
+        cookie.push_str("; Secure");
+    }
     let mut headers_out = HeaderMap::new();
     let _ = headers_out.insert(
         header::SET_COOKIE,
-        axum::http::HeaderValue::from_str(&format!(
-            "burrow_session={}; Path=/; HttpOnly; Max-Age={}",
-            token, SESSION_TTL
-        ))
-        .expect("valid cookie header"),
+        axum::http::HeaderValue::from_str(&cookie).expect("valid cookie header"),
     );
     let _ = headers_out.insert(header::LOCATION, axum::http::HeaderValue::from_static("/admin"));
     (StatusCode::FOUND, headers_out).into_response()

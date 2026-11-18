@@ -119,6 +119,30 @@ async def main():
             got2 = await asyncio.wait_for(rh.recv(), 5)
             check("relay forwards joiner -> host bytes", got2 == b"joiner-says-hi")
 
+        # --- security: strangers and duplicate identities ---
+        async with websockets.connect(WS) as stray:
+            await stray.send(json.dumps({"op": "hello", "mode": "dev", "name": "stray",
+                                         "uuid": offline_uuid("stray")}))
+            await recv_until(stray, "welcome")
+            await recv_until(stray, "friends.sync")
+
+            # A non-friend asking to join must be rejected.
+            await stray.send(json.dumps({"op": "join.begin", "host": a_uuid}))
+            err = await recv_until(stray, "error")
+            check("non-friend join rejected", "not friends" in err.get("message", ""))
+
+            # So must joining your own world.
+            stray_uuid = offline_uuid("stray")
+            await stray.send(json.dumps({"op": "join.begin", "host": stray_uuid}))
+            own = await recv_until(stray, "error")
+            check("self-join rejected", "own world" in own.get("message", ""))
+
+            # A second hello on the same socket must not re-identify.
+            await stray.send(json.dumps({"op": "hello", "mode": "dev", "name": "stray",
+                                        "uuid": stray_uuid}))
+            dup_hello = await recv_until(stray, "error")
+            check("duplicate hello rejected", "already identified" in dup_hello.get("message", ""))
+
         # --- wrong token is rejected ---
         try:
             bad = await websockets.connect(f"{RELAY}?room={ready['roomId']}&token=not-a-token")

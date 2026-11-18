@@ -48,6 +48,7 @@ fn error_op(message: impl std::fmt::Display) -> String {
 async fn run_client(app: Arc<App>, socket: WebSocket) {
     let (tx, mut rx) = mpsc::channel::<String>(64);
     let (mut sink, mut stream) = socket.split();
+    let conn_id = hub::mint_conn_id();
 
     let writer = tokio::spawn(async move {
         use futures_util::SinkExt;
@@ -69,29 +70,41 @@ async fn run_client(app: Arc<App>, socket: WebSocket) {
                 let Some(op) = value.get("op").and_then(Value::as_str) else {
                     continue;
                 };
-                handle_message(&app, &mut identity, &tx, op, &value).await;
+                handle_message(&app, &mut identity, &tx, conn_id, op, &value).await;
             }
             Message::Close(_) => break,
             _ => {}
         }
     }
 
+    // Cleanup only if OUR generation still owns the hub entry — a newer
+    // reconnect must not be evicted by this dying connection.
     if let Some(me) = identity {
-        app.hub.remove(&me).await;
-        {
-            let conn = app.db.lock().unwrap();
-            db::log_event(&conn, "disconnect", None);
+        if app.hub.remove_owned(&me, conn_id).await.is_some() {
+            // A host that vanished takes its hosted-world session with it.
+            app.sessions.lock().await.remove(&me);
+            {
+                let conn = app.db.lock().unwrap();
+                db::log_event(&conn, "disconnect", None);
+            }
+            broadcast_presence(&app, &me).await;
         }
-        broadcast_presence(&app, &me).await;
     }
 
     drop(tx);
     let _ = writer.await;
 }
 
-async fn handle_message(app: &Arc<App>, identity: &mut Option<Uuid>, tx: &Tx, op: &str, v: &Value) {
+async fn handle_message(
+    app: &Arc<App>,
+    identity: &mut Option<Uuid>,
+    tx: &Tx,
+    conn_id: u64,
+    op: &str,
+    v: &Value,
+) {
     match op {
-        "hello" => hello(app, identity, tx, v).await,
+        "hello" => hello(app, identity, tx, conn_id, v).await,
         "friends.sync" => {
             if let Some(me) = identity {
                 send(tx, build_sync(app, me).await).await;
@@ -129,7 +142,13 @@ async fn handle_message(app: &Arc<App>, identity: &mut Option<Uuid>, tx: &Tx, op
     }
 }
 
-async fn hello(app: &Arc<App>, identity: &mut Option<Uuid>, tx: &Tx, v: &Value) {
+async fn hello(app: &Arc<App>, identity: &mut Option<Uuid>, tx: &Tx, conn_id: u64, v: &Value) {
+    if identity.is_some() {
+        // One identity per websocket: a second hello would orphan the first
+        // hub entry without ever cleaning it up.
+        send(tx, error_op("this connection is already identified")).await;
+        return;
+    }
     let mode = v.get("mode").and_then(Value::as_str).unwrap_or("anonymous");
 
     let (uuid, name) = match mode {
@@ -154,26 +173,26 @@ async fn hello(app: &Arc<App>, identity: &mut Option<Uuid>, tx: &Tx, v: &Value) 
             (uuid, name)
         }
         // Real Microsoft/Xbox authentication lands with the next milestone.
-        // Until then, non-dev clients get a fresh identity under their chosen
-        // name, which is enough to exercise the UI against a real server.
+        // Until then, non-dev clients get a fresh, uniquely-named identity
+        // (the unique name keeps the users table happy for multiple guests).
         _ => {
-            let name = v
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("Guest")
-                .to_string();
-            (Uuid::new_v4(), name)
+            let uuid = Uuid::new_v4();
+            let short = &uuid.simple().to_string()[..8];
+            let name = format!("Guest-{}", short);
+            (uuid, name)
         }
     };
 
     {
         let conn = app.db.lock().unwrap();
-        db::upsert_user(&conn, uuid, &name).ok();
+        if let Err(e) = db::upsert_user(&conn, uuid, &name) {
+            tracing::warn!("failed to upsert user {}: {}", name, e);
+        }
         db::log_event(&conn, "hello", None);
     }
 
     app.hub
-        .insert(uuid, hub::HubClient { name: name.clone(), tx: tx.clone() })
+        .insert(uuid, hub::HubClient { name: name.clone(), tx: tx.clone(), conn_id })
         .await;
     *identity = Some(uuid);
 
@@ -254,6 +273,7 @@ async fn friend_add(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
             let conn = app.db.lock().unwrap();
             db::delete_request(&conn, &target_uuid, me);
             db::add_friendship(&conn, &target_uuid, me);
+            db::log_event(&conn, "friend_added", None);
         }
         send(tx, build_sync(app, me).await).await;
         if let Some(other) = app.hub.tx(&target_uuid).await {
@@ -378,6 +398,19 @@ async fn join_begin(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
         send(tx, error_op("join.begin requires a host uuid")).await;
         return;
     };
+    if host == *me {
+        send(tx, error_op("that's your own world 🙂")).await;
+        return;
+    }
+    // Only actual friends may open a room into someone's world.
+    let friends = {
+        let conn = app.db.lock().unwrap();
+        db::are_friends(&conn, me, &host)
+    };
+    if !friends {
+        send(tx, error_op("you are not friends with that host")).await;
+        return;
+    }
     let host_world = app.sessions.lock().await.get(&host).cloned();
     let Some(world) = host_world else {
         send(tx, error_op("that friend is not hosting right now")).await;

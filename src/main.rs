@@ -14,7 +14,9 @@ async fn main() {
 
     let bind = std::env::var("BURROW_BIND").unwrap_or_else(|_| "0.0.0.0:8787".into());
     let db_path = std::env::var("BURROW_DB").unwrap_or_else(|_| "burrow.db".into());
-    let dev_mode = std::env::var("BURROW_DEV_MODE").map(|v| v != "0").unwrap_or(false);
+    let dev_mode = std::env::var("BURROW_DEV_MODE")
+        .map(|v| matches!(v.trim(), "1" | "true"))
+        .unwrap_or(false);
     let admin_token = std::env::var("BURROW_ADMIN_TOKEN").ok().filter(|s| !s.is_empty());
     let discord_client_id = std::env::var("BURROW_DISCORD_CLIENT_ID").ok().filter(|s| !s.is_empty());
     let discord_client_secret = std::env::var("BURROW_DISCORD_CLIENT_SECRET").ok().filter(|s| !s.is_empty());

@@ -26,6 +26,8 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
             kind TEXT NOT NULL,
             ts INTEGER NOT NULL,
             data TEXT);
+        CREATE INDEX IF NOT EXISTS idx_requests_receiver ON requests(receiver);
+        CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
         ",
     )?;
     Ok(conn)
