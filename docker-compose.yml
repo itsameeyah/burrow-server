@@ -1,0 +1,17 @@
+services:
+  burrow:
+    build: .
+    container_name: burrow
+    restart: unless-stopped
+    ports:
+      # LAN phase only — this mapping goes away when the cloudflared
+      # sidecar takes over in phase 2.
+      - "8787:8787"
+    volumes:
+      - ./data:/data
+    environment:
+      # Dev identities are accepted during the LAN testing phase.
+      # Flip to "0" once real Microsoft auth lands.
+      BURROW_DEV_MODE: "1"
+      # Set BURROW_ADMIN_TOKEN to publish the placeholder dashboard;
+      # the real Discord-OAuth dashboard arrives in milestone 3.
