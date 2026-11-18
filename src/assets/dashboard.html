@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Burrow — mission control</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Quicksand:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+    --bg: #fff0f7;
+    --text: #9e3f77;
+    --card-bg: #ffffff;
+    --header-text: #c2427f;
+    --drawer-bg: #ffd6e7;
+    --text-muted: #a34f81;
+    --radius: 12px;
+}
+* { box-sizing: border-box; }
+body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Quicksand', Arial, sans-serif;
+    margin: 0;
+    padding: 32px 16px 64px;
+}
+.blobs { position: fixed; inset: 0; z-index: -1; overflow: hidden; }
+.blobs div { position: absolute; border-radius: 50%; background: var(--drawer-bg); opacity: 0.25; }
+.b1 { width: 55vmin; height: 55vmin; top: -10vmin; left: -15vmin; animation: drift 34s ease-in-out infinite alternate; }
+.b2 { width: 40vmin; height: 40vmin; bottom: -5vmin; right: -10vmin; animation: drift 46s ease-in-out infinite alternate-reverse; }
+.b3 { width: 26vmin; height: 26vmin; top: 40%; left: 60%; animation: drift 52s ease-in-out infinite alternate; }
+@keyframes drift { from { transform: translate(0, 0) scale(1); } to { transform: translate(6vmin, -4vmin) scale(1.15); } }
+.wrap { max-width: 880px; margin: 0 auto; }
+h1 { color: var(--header-text); font-weight: 700; font-size: 26px; margin: 0 0 4px; }
+.sub { color: var(--text-muted); margin: 0 0 24px; font-size: 14px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; margin-bottom: 24px; }
+.tile {
+    background: var(--card-bg); border-radius: var(--radius);
+    padding: 14px 16px; box-shadow: 0 6px 18px rgba(158, 63, 119, 0.10);
+}
+.tile .num { font-size: 24px; font-weight: 700; color: var(--header-text); }
+.tile .label { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+.card {
+    background: var(--card-bg); border-radius: var(--radius);
+    padding: 18px 20px 14px; margin-bottom: 20px;
+    box-shadow: 0 6px 18px rgba(158, 63, 119, 0.10);
+}
+.card h2 { font-size: 15px; color: var(--header-text); margin: 0 0 10px; font-weight: 500; }
+.foot { color: var(--text-muted); font-size: 12px; text-align: center; margin-top: 8px; }
+.uplot { font-family: 'Quicksand', Arial, sans-serif; }
+.ulegend { display: none !important; }
+</style>
+{{UPLOT_CSS}}
+</head>
+<body>
+<div class="blobs"><div class="b1"></div><div class="b2"></div><div class="b3"></div></div>
+<div class="wrap">
+    <h1>🐇 Burrow — mission control</h1>
+    <p class="sub">aggregated counts only — safe to screenshot anywhere</p>
+
+    <div class="tiles">
+        <div class="tile"><div class="num" id="t-users_total">–</div><div class="label">lifetime users</div></div>
+        <div class="tile"><div class="num" id="t-online_now">–</div><div class="label">online now</div></div>
+        <div class="tile"><div class="num" id="t-active_sessions">–</div><div class="label">active worlds</div></div>
+        <div class="tile"><div class="num" id="t-friendships_total">–</div><div class="label">friendships</div></div>
+        <div class="tile"><div class="num" id="t-relay_rooms">–</div><div class="label">relay rooms</div></div>
+        <div class="tile"><div class="num" id="t-events_24h">–</div><div class="label">events (24h)</div></div>
+    </div>
+
+    <div class="card">
+        <h2>activity — events per day (30 days)</h2>
+        <div id="chart-events"></div>
+    </div>
+    <div class="card">
+        <h2>growth — lifetime users</h2>
+        <div id="chart-users"></div>
+    </div>
+    <p class="foot">burrow · meeyah.dev</p>
+</div>
+<script>{{UPLOT_JS}}</script>
+<script>
+function refreshTiles() {
+    fetch('/api/metrics').then(r => r.json()).then(m => {
+        for (const [k, v] of Object.entries(m)) {
+            const el = document.getElementById('t-' + k);
+            if (el) el.textContent = v;
+        }
+    }).catch(() => {});
+}
+refreshTiles();
+setInterval(refreshTiles, 5000);
+
+fetch('/api/metrics/history?days=30').then(r => r.json()).then(h => {
+    function makeChart(container, data, color) {
+        if (!data || !data[0] || data[0].length < 2) { container.textContent = 'not enough history yet 🙂'; return; }
+        new uPlot({
+            width: container.clientWidth - 8,
+            height: 200,
+            stroke: { 0: color },
+            fill: { 0: color + '22' },
+            axes: [
+                {},
+                { values: (u, vals) => vals.map(v => v.toFixed(0)) }
+            ],
+            scales: { x: { time: true } },
+            cursor: { drag: false }
+        }, data, container);
+    }
+    makeChart(document.getElementById('chart-events'), h.events, '#c2427f');
+    makeChart(document.getElementById('chart-users'), h.usersTotal, '#9e3f77');
+}).catch(() => {});
+</script>
+</body>
+</html>

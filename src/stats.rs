@@ -32,3 +32,58 @@ pub async fn snapshot(app: &Arc<App>) -> Value {
         "events_24h": events_24h,
     })
 }
+
+/// Per-day series for the dashboard graphs. Counts only, never names.
+/// Shape: { "events": [[dayTs...],[count...]], "usersNew": [[...],[...]], "usersTotal": [[...],[...] }
+pub async fn history(app: &Arc<App>, days: i64) -> Value {
+    let since = db::now() - days.max(1) * 86_400;
+
+    let events;
+    let users_new;
+    let users_total;
+    {
+        let conn = app.db.lock().unwrap();
+        events = db::events_by_day(&conn, since);
+        users_new = db::users_by_day(&conn, since);
+        users_total = db::count(&conn, "SELECT COUNT(*) FROM users");
+    }
+
+    // Users registered before the window starts, for the cumulative walk.
+    let users_before =
+        users_total - users_new.iter().map(|(_, c)| *c).sum::<i64>();
+
+    // Merge per-kind rows into one total-per-day series.
+    let mut event_days: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
+    for (day, _kind, count) in &events {
+        *event_days.entry(*day).or_insert(0) += *count;
+    }
+    let mut user_days: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
+    for (day, count) in &users_new {
+        user_days.entry(*day).or_insert(0);
+        *user_days.get_mut(day).unwrap() += *count;
+    }
+
+    // Cumulative users: start from everyone registered before the window.
+    let mut running = users_before;
+    let mut total_days: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
+    for (day, count) in &user_days {
+        running += *count;
+        total_days.insert(*day, running);
+    }
+
+    let events_value = series(&event_days);
+    let users_new_value = series(&user_days);
+    let users_total_value = series(&total_days);
+
+    json!({
+        "events": events_value,
+        "usersNew": users_new_value,
+        "usersTotal": users_total_value,
+    })
+}
+
+fn series(map: &std::collections::BTreeMap<i64, i64>) -> Value {
+    let xs: Vec<i64> = map.keys().copied().collect();
+    let ys: Vec<i64> = map.values().copied().collect();
+    json!([xs, ys])
+}

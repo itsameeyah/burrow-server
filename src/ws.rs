@@ -20,6 +20,15 @@ pub struct App {
     pub sessions: tokio::sync::Mutex<HashMap<Uuid, String>>,
     pub dev_mode: bool,
     pub admin_token: Option<String>,
+    /// Discord OAuth gate for the dashboard (all optional until configured).
+    pub discord_client_id: Option<String>,
+    pub discord_client_secret: Option<String>,
+    pub discord_redirect_uri: Option<String>,
+    pub discord_allowed_user_id: Option<String>,
+    /// Short-lived CSRF states for OAuth round-trips.
+    pub oauth_states: tokio::sync::Mutex<HashMap<String, i64>>,
+    /// Signed-in dashboard sessions (cookie token -> expiry).
+    pub dash_sessions: tokio::sync::Mutex<HashMap<String, i64>>,
 }
 
 type Tx = mpsc::Sender<String>;

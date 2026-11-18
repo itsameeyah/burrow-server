@@ -210,3 +210,37 @@ pub fn count_where_ts(conn: &Connection, kind_filter: Option<&str>, since: i64) 
             .unwrap_or(0),
     }
 }
+
+/// (midnight-ts, kind, count) for every logged event since `since`.
+pub fn events_by_day(conn: &Connection, since: i64) -> Vec<(i64, String, i64)> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT (ts / 86400) * 86400 AS day, kind, COUNT(*) \
+         FROM events WHERE ts >= ?1 GROUP BY day, kind ORDER BY day",
+    ) else {
+        return Vec::new();
+    };
+    let rows = stmt.query_map(rusqlite::params![since], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+    });
+    match rows {
+        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// (midnight-ts, new-users-that-day) since `since`.
+pub fn users_by_day(conn: &Connection, since: i64) -> Vec<(i64, i64)> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT (created_at / 86400) * 86400 AS day, COUNT(*) \
+         FROM users WHERE created_at >= ?1 GROUP BY day ORDER BY day",
+    ) else {
+        return Vec::new();
+    };
+    let rows = stmt.query_map(rusqlite::params![since], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+    });
+    match rows {
+        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
