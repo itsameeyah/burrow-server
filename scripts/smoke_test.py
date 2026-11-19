@@ -1,24 +1,43 @@
 #!/usr/bin/env python3
 """Burrow server end-to-end protocol smoke test.
 
-Pretends to be two dev Minecraft clients (meeyah + testbunny) and walks the
-whole M1 flow: hello -> friend request -> accept -> live presence ->
-session hosting -> join handshake -> relay byte splice in both directions.
+Pretends to be dev/Mojang Minecraft clients and walks the full flow:
+hello/auth -> friend request -> accept -> live presence -> session hosting
+(with gameVersion) -> join handshake -> relay byte splice -> access modes ->
+Mojang sessionserver challenge/verify -> rate limiting -> prod-mode rejection.
+
+Env vars:
+  BURROW_TEST_PORT        Target server port (default: 8787).
+  BURROW_MOJANG_MOCK_PORT If set, starts a local mock Mojang sessionserver on
+                          127.0.0.1:<port> (match BURROW_MOJANG_SESSION_URL)
+                          and runs Mojang auth challenge/verify checks.
+  BURROW_TEST_DEV_MODE    "1" (default) runs the full dev-mode E2E suite;
+                          "0" verifies dev & anonymous hellos are rejected
+                          and Mojang auth succeeds against a prod-mode server.
+
 Exit code 0 only if every check passes.
 """
 
 import asyncio
 import hashlib
+import http.server
 import json
+import os
 import sys
+import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
 import websockets
 
-WS = "ws://127.0.0.1:8787/ws"
-RELAY = "ws://127.0.0.1:8787/relay/ws"
+PORT = int(os.environ.get("BURROW_TEST_PORT", "8787"))
+WS = f"ws://127.0.0.1:{PORT}/ws"
+RELAY = f"ws://127.0.0.1:{PORT}/relay/ws"
+HTTP_BASE = f"http://127.0.0.1:{PORT}"
+MOJANG_MOCK_PORT = os.environ.get("BURROW_MOJANG_MOCK_PORT")
+TEST_DEV_MODE = os.environ.get("BURROW_TEST_DEV_MODE", "1").strip() in ("1", "true")
 
 RESULTS = []
 
@@ -46,8 +65,144 @@ async def recv_until(ws, op, pred=None, timeout=5.0):
             return msg
 
 
-async def main():
+class MockMojangServer:
+    """Tiny local HTTP server mimicking sessionserver.mojang.com/session/minecraft/hasJoined."""
+
+    def __init__(self, port: int):
+        self.port = port
+        self.valid_joins: dict[tuple[str, str], tuple[str, str]] = {}
+        self.requests: list[tuple[str, str]] = []
+        parent = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                parsed = urllib.parse.urlparse(self.path)
+                if parsed.path != "/session/minecraft/hasJoined":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                qs = urllib.parse.parse_qs(parsed.query)
+                username = (qs.get("username") or [""])[0]
+                server_id = (qs.get("serverId") or [""])[0]
+                parent.requests.append((username, server_id))
+                entry = parent.valid_joins.get((username, server_id))
+                if entry is None:
+                    self.send_response(204)
+                    self.end_headers()
+                    return
+                raw_id, auth_name = entry
+                body = json.dumps({"id": raw_id, "name": auth_name}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format, *args):
+                pass
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._server.shutdown()
+        self._server.server_close()
+
+
+async def test_mojang_auth(mock: MockMojangServer):
+    # 1. Wrong serverId fails and consumes the challenge (single-use).
+    async with websockets.connect(WS) as ws:
+        await ws.send(json.dumps({"op": "hello", "mode": "mojang", "name": "MojangBunny"}))
+        chal = await recv_until(ws, "auth.challenge")
+        sid = chal.get("serverId", "")
+        check("mojang hello yields 32-char hex serverId challenge",
+              len(sid) == 32 and all(c in "0123456789abcdef" for c in sid))
+
+        await ws.send(json.dumps({"op": "auth.verify", "serverId": "0" * 32}))
+        bad_err = await recv_until(ws, "error")
+        check("mismatched serverId rejected",
+              "Mojang verification failed" in bad_err.get("message", ""))
+
+        # Replaying the real serverId after a failed attempt must also fail (single-use).
+        mock.valid_joins[("MojangBunny", sid)] = ("069a79f444e94726a5befca90e38aaf5", "MojangBunny")
+        await ws.send(json.dumps({"op": "auth.verify", "serverId": sid}))
+        replay_err = await recv_until(ws, "error")
+        check("consumed challenge cannot be replayed",
+              "Mojang verification failed" in replay_err.get("message", ""))
+
+        # Connection must remain unauthenticated.
+        await ws.send(json.dumps({"op": "friend.add", "name": "meeyah"}))
+        unauth_err = await recv_until(ws, "error")
+        check("failed mojang verify leaves connection unauthenticated",
+              "say hello first" in unauth_err.get("message", ""))
+
+    # 2. Sessionserver HTTP 204 fails verification.
+    async with websockets.connect(WS) as ws:
+        await ws.send(json.dumps({"op": "hello", "mode": "mojang", "name": "UnjoinedUser"}))
+        chal = await recv_until(ws, "auth.challenge")
+        sid = chal["serverId"]
+        await ws.send(json.dumps({"op": "auth.verify", "serverId": sid}))
+        err204 = await recv_until(ws, "error")
+        check("mojang 204 response rejected",
+              "Mojang verification failed" in err204.get("message", ""))
+
+    # 3. Valid Mojang sessionserver 200 completes login with authoritative UUID & casing.
+    async with websockets.connect(WS) as ws:
+        await ws.send(json.dumps({"op": "hello", "mode": "mojang", "name": "mojangbunny"}))
+        chal = await recv_until(ws, "auth.challenge")
+        sid = chal["serverId"]
+        raw_id = "069a79f444e94726a5befca90e38aaf5"
+        expected_uuid = "069a79f4-44e9-4726-a5be-fca90e38aaf5"
+        mock.valid_joins[("mojangbunny", sid)] = (raw_id, "MojangBunny")
+
+        await ws.send(json.dumps({"op": "auth.verify", "serverId": sid}))
+        welcome = await recv_until(ws, "welcome")
+        check("mojang verify succeeds with authoritative UUID and name",
+              welcome.get("uuid") == expected_uuid and welcome.get("name") == "MojangBunny")
+        sync = await recv_until(ws, "friends.sync")
+        check("mojang login sends initial friends.sync", sync.get("op") == "friends.sync")
+
+
+async def run_prod_mode_suite(mock: MockMojangServer | None):
+    # Verify dev and anonymous/unknown modes are rejected when BURROW_DEV_MODE=0.
+    async with websockets.connect(WS) as ws:
+        await ws.send(json.dumps({"op": "hello", "mode": "dev", "name": "meeyah",
+                                  "uuid": offline_uuid("meeyah")}))
+        dev_err = await recv_until(ws, "error")
+        check("prod mode rejects dev hello with authentication required",
+              dev_err.get("message") == "authentication required")
+
+        await ws.send(json.dumps({"op": "hello", "mode": "anonymous"}))
+        anon_err = await recv_until(ws, "error")
+        check("prod mode rejects anonymous hello with authentication required",
+              anon_err.get("message") == "authentication required")
+
+        await ws.send(json.dumps({"op": "hello"}))
+        missing_err = await recv_until(ws, "error")
+        check("prod mode rejects missing mode hello with authentication required",
+              missing_err.get("message") == "authentication required")
+
+        await ws.send(json.dumps({"op": "friend.add", "name": "meeyah"}))
+        unauth = await recv_until(ws, "error")
+        check("rejected hello leaves connection unauthenticated",
+              "say hello first" in unauth.get("message", ""))
+
+    if mock is not None:
+        await test_mojang_auth(mock)
+
+
+async def run_dev_mode_suite(mock: MockMojangServer | None):
     async with websockets.connect(WS) as a, websockets.connect(WS) as b:
+        # --- anonymous hello rejected even in dev mode (no throwaway Guest-* rows) ---
+        async with websockets.connect(WS) as anon:
+            await anon.send(json.dumps({"op": "hello", "mode": "anonymous"}))
+            anon_err = await recv_until(anon, "error")
+            check("anonymous hello rejected with authentication required",
+                  anon_err.get("message") == "authentication required")
+
         # --- hello both clients ---
         await a.send(json.dumps({"op": "hello", "mode": "dev", "name": "meeyah",
                                  "uuid": offline_uuid("meeyah")}))
@@ -88,14 +243,26 @@ async def main():
               any(f.get("name") == "testbunny" and f.get("presence") == "online"
                   for f in sync_a2.get("friends", [])))
 
-        # --- presence push when someone disconnects is checked at the end ---
-
-        # --- A opens a hosted world ---
-        await a.send(json.dumps({"op": "session.open", "worldName": "Bunny Burrow"}))
+        # --- A opens a hosted world with gameVersion ---
+        await a.send(json.dumps({
+            "op": "session.open",
+            "worldName": "Bunny Burrow",
+            "gameVersion": "1.21.4",
+        }))
         sess = await recv_until(b, "session.state")
         s0 = sess["sessions"][0]
-        check("B sees A hosting 'Bunny Burrow'",
-              s0.get("host") == a_uuid and s0.get("worldName") == "Bunny Burrow" and s0.get("active"))
+        check("B sees A hosting 'Bunny Burrow' with gameVersion 1.21.4",
+              s0.get("host") == a_uuid
+              and s0.get("worldName") == "Bunny Burrow"
+              and s0.get("gameVersion") == "1.21.4"
+              and s0.get("active"))
+
+        # Check gameVersion in friends.sync (friends array)
+        await b.send(json.dumps({"op": "friends.sync"}))
+        sync_ver = await recv_until(b, "friends.sync")
+        check("friends.sync carries gameVersion in friends list",
+              any(f.get("uuid") == a_uuid and f.get("gameVersion") == "1.21.4"
+                  for f in sync_ver.get("friends", [])))
 
         # --- B asks to join ---
         await b.send(json.dumps({"op": "join.begin", "host": a_uuid}))
@@ -141,7 +308,7 @@ async def main():
 
             # A second hello on the same socket must not re-identify.
             await stray.send(json.dumps({"op": "hello", "mode": "dev", "name": "stray",
-                                        "uuid": stray_uuid}))
+                                         "uuid": stray_uuid}))
             dup_hello = await recv_until(stray, "error")
             check("duplicate hello rejected", "already identified" in dup_hello.get("message", ""))
 
@@ -188,10 +355,23 @@ async def main():
             await h3.send(json.dumps({"op": "friend.accept", "uuid": h2_uuid}))
             await recv_until(h3, "friends.sync")
 
-            await a.send(json.dumps({"op": "session.update", "access": "friends_of_friends"}))
+            await a.send(json.dumps({
+                "op": "session.update",
+                "access": "friends_of_friends",
+                "gameVersion": "1.21.5",
+            }))
             h2_sess = await recv_until(h2, "session.state")
-            check("hop2 sees A's FOF world via testbunny",
-                  h2_sess["sessions"][0].get("active") is True and h2_sess["sessions"][0].get("viaName") == "testbunny")
+            check("hop2 sees A's FOF world via testbunny with updated gameVersion 1.21.5",
+                  h2_sess["sessions"][0].get("active") is True
+                  and h2_sess["sessions"][0].get("viaName") == "testbunny"
+                  and h2_sess["sessions"][0].get("gameVersion") == "1.21.5")
+
+            # Check gameVersion in friends.sync (discoverable array)
+            await h2.send(json.dumps({"op": "friends.sync"}))
+            h2_sync = await recv_until(h2, "friends.sync")
+            check("friends.sync carries gameVersion in discoverable list",
+                  any(d.get("host") == a_uuid and d.get("gameVersion") == "1.21.5"
+                      for d in h2_sync.get("discoverable", [])))
 
             await h2.send(json.dumps({"op": "join.begin", "host": a_uuid}))
             await recv_until(h2, "join.ready")
@@ -253,6 +433,34 @@ async def main():
               and "meeyah" in chk.get("names", [])
               and "nobody_has_burrow" not in chk.get("names", []))
 
+        # --- MC username rename safety (case-insensitive collision by different UUID) ---
+        u_old = str(uuid.uuid4())
+        u_new = str(uuid.uuid4())
+        async with websockets.connect(WS) as r1:
+            await r1.send(json.dumps({"op": "hello", "mode": "dev", "name": "SwapName", "uuid": u_old}))
+            await recv_until(r1, "welcome")
+        async with websockets.connect(WS) as r2:
+            await r2.send(json.dumps({"op": "hello", "mode": "dev", "name": "swapname", "uuid": u_new}))
+            w_r2 = await recv_until(r2, "welcome")
+            check("username rename takeover succeeds for new UUID",
+                  w_r2.get("uuid") == u_new and w_r2.get("name") == "swapname")
+            await b.send(json.dumps({"op": "users.check", "uuids": [u_old, u_new], "names": ["SwapName"]}))
+            chk_r = await recv_until(b, "users.check.result")
+            check("both old and new UUIDs remain registered after rename",
+                  u_old in chk_r.get("uuids", []) and u_new in chk_r.get("uuids", []))
+
+        # --- per-connection signaling rate limit ---
+        async with websockets.connect(WS) as flood:
+            for _ in range(42):
+                await flood.send(json.dumps({"op": "friends.sync"}))
+            rl_err = await recv_until(flood, "error")
+            check("signaling rate limit rejects rapid flood",
+                  "rate limit" in rl_err.get("message", ""))
+
+        # --- Mojang sessionserver challenge/verify flow (when mock port configured) ---
+        if mock is not None:
+            await test_mojang_auth(mock)
+
         # --- wrong token is rejected ---
         try:
             bad = await websockets.connect(f"{RELAY}?room={ready['roomId']}&token=not-a-token")
@@ -269,7 +477,7 @@ async def main():
 
         # --- metrics stays unpublished without a token ---
         try:
-            urllib.request.urlopen("http://127.0.0.1:8787/api/metrics")
+            urllib.request.urlopen(f"{HTTP_BASE}/api/metrics")
             check("metrics hidden without token (404)", False)
         except urllib.error.HTTPError as e:
             check("metrics hidden without token (404)", e.code == 404)
@@ -294,6 +502,21 @@ async def main():
         check("B sees A go offline on disconnect",
               any(u.get("uuid") == a_uuid and u.get("presence") == "offline"
                   for u in pres.get("updates", [])))
+
+
+async def main():
+    mock = None
+    if MOJANG_MOCK_PORT:
+        mock = MockMojangServer(int(MOJANG_MOCK_PORT))
+        mock.start()
+    try:
+        if TEST_DEV_MODE:
+            await run_dev_mode_suite(mock)
+        else:
+            await run_prod_mode_suite(mock)
+    finally:
+        if mock is not None:
+            mock.stop()
 
     fails = [n for n, ok in RESULTS if not ok]
     print(f"\n{len(RESULTS) - len(fails)}/{len(RESULTS)} checks passed")

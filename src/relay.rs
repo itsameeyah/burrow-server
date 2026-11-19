@@ -17,6 +17,8 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+pub const MAX_ROOMS_PER_HOST: usize = 64;
+
 pub struct Room {
     pub host: Option<oneshot::Sender<WebSocket>>,
     pub joiner: Option<oneshot::Sender<WebSocket>>,
@@ -27,6 +29,7 @@ pub struct Room {
 #[derive(Default)]
 pub struct Relay {
     pub rooms: std::sync::Mutex<HashMap<Uuid, Room>>,
+    host_counts: std::sync::Mutex<HashMap<Uuid, usize>>,
     active_tunnels: AtomicUsize,
 }
 
@@ -42,7 +45,23 @@ impl Relay {
 
     /// Create a room and spawn its broker. The broker waits (bounded) for
     /// both parties, splices their sockets, then removes the room.
-    pub fn create_room(&self, app: &Arc<App>, _joiner: Uuid) -> (Uuid, String, String) {
+    /// Returns `None` if `host` already has `MAX_ROOMS_PER_HOST` pending+active rooms.
+    pub fn create_room(
+        &self,
+        app: &Arc<App>,
+        host: Uuid,
+        _joiner: Uuid,
+    ) -> Option<(Uuid, String, String)> {
+        {
+            let mut counts = self.host_counts.lock().unwrap();
+            let count = counts.entry(host).or_insert(0);
+            if *count >= MAX_ROOMS_PER_HOST {
+                return None;
+            }
+            *count += 1;
+        }
+
+        let host_guard = HostRoomGuard { app: app.clone(), host };
         let room_id = Uuid::new_v4();
         let host_token = Uuid::new_v4().to_string();
         let joiner_token = Uuid::new_v4().to_string();
@@ -57,8 +76,26 @@ impl Relay {
                 joiner_token: joiner_token.clone(),
             },
         );
-        tokio::spawn(broker(app.clone(), room_id, host_rx, joiner_rx));
-        (room_id, host_token, joiner_token)
+        tokio::spawn(broker(app.clone(), room_id, host_rx, joiner_rx, host_guard));
+        Some((room_id, host_token, joiner_token))
+    }
+}
+
+struct HostRoomGuard {
+    app: Arc<App>,
+    host: Uuid,
+}
+
+impl Drop for HostRoomGuard {
+    fn drop(&mut self) {
+        let mut counts = self.app.relay.host_counts.lock().unwrap();
+        if let Some(c) = counts.get_mut(&self.host) {
+            if *c <= 1 {
+                counts.remove(&self.host);
+            } else {
+                *c -= 1;
+            }
+        }
     }
 }
 
@@ -82,6 +119,7 @@ async fn broker(
     room_id: Uuid,
     host_rx: oneshot::Receiver<WebSocket>,
     joiner_rx: oneshot::Receiver<WebSocket>,
+    _host_guard: HostRoomGuard,
 ) {
     let paired = tokio::time::timeout(
         Duration::from_secs(60),
@@ -208,3 +246,42 @@ pub async fn relay_handler(
 }
 
 use futures_util::StreamExt;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn per_host_room_cap_enforced() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let app = Arc::new(App {
+            db: std::sync::Mutex::new(conn),
+            hub: crate::hub::Hub::new(),
+            relay: Relay::new(),
+            sessions: tokio::sync::Mutex::new(HashMap::new()),
+            activities: tokio::sync::Mutex::new(HashMap::new()),
+            dev_mode: false,
+            mojang_session_url: "https://sessionserver.mojang.com".into(),
+            admin_token: None,
+            discord_client_id: None,
+            discord_client_secret: None,
+            discord_redirect_uri: None,
+            discord_allowed_user_id: None,
+            oauth_states: tokio::sync::Mutex::new(HashMap::new()),
+            dash_sessions: tokio::sync::Mutex::new(HashMap::new()),
+            http: reqwest::Client::new(),
+        });
+
+        let host_a = Uuid::new_v4();
+        let host_b = Uuid::new_v4();
+        let joiner = Uuid::new_v4();
+
+        for _ in 0..MAX_ROOMS_PER_HOST {
+            assert!(app.relay.create_room(&app, host_a, joiner).is_some());
+        }
+        // 65th room for host_a must be rejected.
+        assert!(app.relay.create_room(&app, host_a, joiner).is_none());
+        // Different host_b is unaffected.
+        assert!(app.relay.create_room(&app, host_b, joiner).is_some());
+    }
+}

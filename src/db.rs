@@ -43,12 +43,20 @@ pub fn now() -> i64 {
         .unwrap_or(0)
 }
 
-pub fn upsert_user(conn: &Connection, uuid: Uuid, name: &str) -> rusqlite::Result<()> {
-    conn.execute(
+pub fn upsert_user(conn: &mut Connection, uuid: Uuid, name: &str) -> rusqlite::Result<()> {
+    let tx = conn.transaction()?;
+    let uuid_str = uuid.to_string();
+    tx.execute(
+        "UPDATE users SET name = 'renamed-' || substr(uuid, 1, 8)
+         WHERE lower(name) = lower(?1) AND uuid != ?2",
+        rusqlite::params![name, &uuid_str],
+    )?;
+    tx.execute(
         "INSERT INTO users(uuid, name, created_at) VALUES(?1, ?2, ?3)
          ON CONFLICT(uuid) DO UPDATE SET name = excluded.name",
-        rusqlite::params![uuid.to_string(), name, now()],
+        rusqlite::params![&uuid_str, name, now()],
     )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -288,5 +296,49 @@ pub fn users_by_day(conn: &Connection, since: i64) -> Vec<(i64, i64)> {
     match rows {
         Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
         Err(_) => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upsert_user_handles_username_rename_case_insensitively() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users(
+                uuid TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                created_at INTEGER NOT NULL);
+             CREATE TABLE friendships(
+                a TEXT NOT NULL,
+                b TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY(a, b));",
+        )
+        .unwrap();
+
+        let u1 = Uuid::new_v4();
+        let u2 = Uuid::new_v4();
+        let friend = Uuid::new_v4();
+
+        upsert_user(&mut conn, u1, "Steve").unwrap();
+        upsert_user(&mut conn, friend, "Friend").unwrap();
+        add_friendship(&conn, &u1, &friend);
+
+        // u2 takes u1's old username with different casing after u1 renamed in MC.
+        upsert_user(&mut conn, u2, "steve").unwrap();
+
+        assert_eq!(user_by_name(&conn, "Steve"), Some((u2, "steve".into())));
+        let u1_renamed = user_name_by_uuid(&conn, &u1).unwrap();
+        assert!(u1_renamed.starts_with("renamed-"));
+        // u1's friendship is intact.
+        assert!(are_friends(&conn, &u1, &friend));
+
+        // Later u1 signs in with their new Minecraft username.
+        upsert_user(&mut conn, u1, "Alex").unwrap();
+        assert_eq!(user_by_name(&conn, "Alex"), Some((u1, "Alex".into())));
+        assert_eq!(user_by_name(&conn, "steve"), Some((u2, "steve".into())));
     }
 }

@@ -22,6 +22,11 @@ async fn main() {
     let discord_client_secret = std::env::var("BURROW_DISCORD_CLIENT_SECRET").ok().filter(|s| !s.is_empty());
     let discord_redirect_uri = std::env::var("BURROW_DISCORD_REDIRECT_URI").ok().filter(|s| !s.is_empty());
     let discord_allowed_user_id = std::env::var("BURROW_DISCORD_ALLOWED_USER_ID").ok().filter(|s| !s.is_empty());
+    let mojang_session_url = std::env::var("BURROW_MOJANG_SESSION_URL")
+        .ok()
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://sessionserver.mojang.com".into());
 
     let conn = db::open(&PathBuf::from(&db_path)).expect("failed to open database");
 
@@ -32,6 +37,7 @@ async fn main() {
         sessions: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         activities: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         dev_mode,
+        mojang_session_url,
         admin_token,
         discord_client_id,
         discord_client_secret,

@@ -8,8 +8,9 @@ use axum::extract::State;
 use axum::response::Response;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -67,10 +68,17 @@ impl InvitePerm {
 }
 
 const INVITE_TTL_SECS: i64 = 30;
+const AUTH_CHALLENGE_TTL_SECS: i64 = 30;
+const MOJANG_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
+const RATE_LIMIT_MAX: usize = 40;
+const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(5);
+const RATE_LIMIT_CLOSE_STRIKES: u32 = 10;
+const MAX_SIGNALING_MSG_BYTES: usize = 65_536;
 
 #[derive(Clone, Debug)]
 pub struct HostedSession {
     pub world_name: String,
+    pub game_version: String,
     pub access: AccessMode,
     pub invite_perm: InvitePerm,
     pub locked: bool,
@@ -109,6 +117,8 @@ pub struct App {
     pub sessions: tokio::sync::Mutex<HashMap<Uuid, HostedSession>>,
     pub activities: tokio::sync::Mutex<HashMap<Uuid, ClientActivity>>,
     pub dev_mode: bool,
+    /// Base URL for Mojang sessionserver (overridable via BURROW_MOJANG_SESSION_URL for tests).
+    pub mojang_session_url: String,
     pub admin_token: Option<String>,
     /// Discord OAuth gate for the dashboard (all optional until configured).
     pub discord_client_id: Option<String>,
@@ -137,6 +147,12 @@ fn error_op(message: impl std::fmt::Display) -> String {
     json!({"op": "error", "message": message.to_string()}).to_string()
 }
 
+struct PendingAuth {
+    server_id: String,
+    claimed_name: String,
+    expires_at: i64,
+}
+
 async fn run_client(app: Arc<App>, socket: WebSocket) {
     let (tx, mut rx) = mpsc::channel::<String>(64);
     let (mut sink, mut stream) = socket.split();
@@ -152,17 +168,46 @@ async fn run_client(app: Arc<App>, socket: WebSocket) {
     });
 
     let mut identity: Option<Uuid> = None;
+    let mut pending_auth: Option<PendingAuth> = None;
+    let mut msg_times: VecDeque<Instant> = VecDeque::with_capacity(RATE_LIMIT_MAX);
+    let mut rate_strikes: u32 = 0;
 
     while let Some(Ok(msg)) = stream.next().await {
         match msg {
             Message::Text(text) => {
+                let now_inst = Instant::now();
+                while msg_times
+                    .front()
+                    .is_some_and(|t| now_inst.duration_since(*t) >= RATE_LIMIT_WINDOW)
+                {
+                    msg_times.pop_front();
+                }
+                if msg_times.len() >= RATE_LIMIT_MAX {
+                    rate_strikes += 1;
+                    send(&tx, error_op("rate limit exceeded — slow down")).await;
+                    if rate_strikes >= RATE_LIMIT_CLOSE_STRIKES {
+                        tracing::warn!(
+                            "closing signaling connection {conn_id} for sustained rate-limit abuse"
+                        );
+                        break;
+                    }
+                    continue;
+                }
+                msg_times.push_back(now_inst);
+                rate_strikes = 0;
+
+                if text.len() > MAX_SIGNALING_MSG_BYTES {
+                    send(&tx, error_op("message too large")).await;
+                    continue;
+                }
                 let Ok(value) = serde_json::from_str::<Value>(&text) else {
                     continue;
                 };
                 let Some(op) = value.get("op").and_then(Value::as_str) else {
                     continue;
                 };
-                handle_message(&app, &mut identity, &tx, conn_id, op, &value).await;
+                handle_message(&app, &mut identity, &mut pending_auth, &tx, conn_id, op, &value)
+                    .await;
             }
             Message::Close(_) => break,
             _ => {}
@@ -194,13 +239,15 @@ async fn run_client(app: Arc<App>, socket: WebSocket) {
 async fn handle_message(
     app: &Arc<App>,
     identity: &mut Option<Uuid>,
+    pending_auth: &mut Option<PendingAuth>,
     tx: &Tx,
     conn_id: u64,
     op: &str,
     v: &Value,
 ) {
     match op {
-        "hello" => hello(app, identity, tx, conn_id, v).await,
+        "hello" => hello(app, identity, pending_auth, tx, conn_id, v).await,
+        "auth.verify" => auth_verify(app, identity, pending_auth, tx, conn_id, v).await,
         "friends.sync" => {
             if let Some(me) = identity {
                 send(tx, build_sync(app, me).await).await;
@@ -258,21 +305,42 @@ async fn handle_message(
     }
 }
 
-async fn hello(app: &Arc<App>, identity: &mut Option<Uuid>, tx: &Tx, conn_id: u64, v: &Value) {
+async fn hello(
+    app: &Arc<App>,
+    identity: &mut Option<Uuid>,
+    pending_auth: &mut Option<PendingAuth>,
+    tx: &Tx,
+    conn_id: u64,
+    v: &Value,
+) {
     if identity.is_some() {
         // One identity per websocket: a second hello would orphan the first
         // hub entry without ever cleaning it up.
         send(tx, error_op("this connection is already identified")).await;
         return;
     }
-    let mode = v.get("mode").and_then(Value::as_str).unwrap_or("anonymous");
+    let mode = v.get("mode").and_then(Value::as_str).unwrap_or("");
 
-    let (uuid, name) = match mode {
-        "dev" => {
-            if !app.dev_mode {
-                send(tx, error_op("this server does not accept dev identities")).await;
+    match mode {
+        "mojang" => {
+            let Some(claimed_name) = v
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && s.len() <= 32)
+            else {
+                send(tx, error_op("mojang hello requires a name")).await;
                 return;
-            }
+            };
+            let server_id = Uuid::new_v4().simple().to_string();
+            *pending_auth = Some(PendingAuth {
+                server_id: server_id.clone(),
+                claimed_name: claimed_name.to_string(),
+                expires_at: db::now() + AUTH_CHALLENGE_TTL_SECS,
+            });
+            send(tx, json!({"op": "auth.challenge", "serverId": server_id}).to_string()).await;
+        }
+        "dev" if app.dev_mode => {
             let name = v
                 .get("name")
                 .and_then(Value::as_str)
@@ -286,22 +354,106 @@ async fn hello(app: &Arc<App>, identity: &mut Option<Uuid>, tx: &Tx, conn_id: u6
                 send(tx, error_op("dev hello requires a uuid")).await;
                 return;
             };
-            (uuid, name)
+            *pending_auth = None;
+            complete_login(app, identity, tx, conn_id, uuid, name).await;
         }
-        // Real Microsoft/Xbox authentication lands with the next milestone.
-        // Until then, non-dev clients get a fresh, uniquely-named identity
-        // (the unique name keeps the users table happy for multiple guests).
         _ => {
-            let uuid = Uuid::new_v4();
-            let short = &uuid.simple().to_string()[..8];
-            let name = format!("Guest-{}", short);
-            (uuid, name)
+            send(tx, error_op("authentication required")).await;
+        }
+    }
+}
+
+async fn auth_verify(
+    app: &Arc<App>,
+    identity: &mut Option<Uuid>,
+    pending_auth: &mut Option<PendingAuth>,
+    tx: &Tx,
+    conn_id: u64,
+    v: &Value,
+) {
+    const FAIL_MSG: &str = "Mojang verification failed — please restart Minecraft";
+
+    if identity.is_some() {
+        send(tx, error_op("this connection is already identified")).await;
+        return;
+    }
+    // Consume the pending challenge immediately so it is strictly single-use.
+    let Some(pending) = pending_auth.take() else {
+        send(tx, error_op(FAIL_MSG)).await;
+        return;
+    };
+    let Some(server_id) = v.get("serverId").and_then(Value::as_str) else {
+        send(tx, error_op(FAIL_MSG)).await;
+        return;
+    };
+    if server_id != pending.server_id || db::now() > pending.expires_at {
+        send(tx, error_op(FAIL_MSG)).await;
+        return;
+    }
+
+    let url = format!(
+        "{}/session/minecraft/hasJoined?username={}&serverId={}",
+        app.mojang_session_url,
+        url_encode(&pending.claimed_name),
+        url_encode(&pending.server_id),
+    );
+    let res = match app.http.get(&url).timeout(MOJANG_VERIFY_TIMEOUT).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("mojang hasJoined request failed for {}: {}", pending.claimed_name, e);
+            send(tx, error_op(FAIL_MSG)).await;
+            return;
         }
     };
+    if res.status() != reqwest::StatusCode::OK {
+        tracing::info!(
+            "mojang hasJoined rejected {} with status {}",
+            pending.claimed_name,
+            res.status()
+        );
+        send(tx, error_op(FAIL_MSG)).await;
+        return;
+    }
+    let Ok(body) = res.json::<Value>().await else {
+        tracing::warn!("mojang hasJoined returned invalid JSON for {}", pending.claimed_name);
+        send(tx, error_op(FAIL_MSG)).await;
+        return;
+    };
+    let Some(uuid) = body
+        .get("id")
+        .and_then(Value::as_str)
+        .and_then(|s| Uuid::parse_str(s).ok())
+    else {
+        tracing::warn!("mojang hasJoined missing valid id for {}", pending.claimed_name);
+        send(tx, error_op(FAIL_MSG)).await;
+        return;
+    };
+    let Some(name) = body
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+    else {
+        tracing::warn!("mojang hasJoined missing valid name for {}", pending.claimed_name);
+        send(tx, error_op(FAIL_MSG)).await;
+        return;
+    };
 
+    complete_login(app, identity, tx, conn_id, uuid, name).await;
+}
+
+async fn complete_login(
+    app: &Arc<App>,
+    identity: &mut Option<Uuid>,
+    tx: &Tx,
+    conn_id: u64,
+    uuid: Uuid,
+    name: String,
+) {
     {
-        let conn = app.db.lock().unwrap();
-        if let Err(e) = db::upsert_user(&conn, uuid, &name) {
+        let mut conn = app.db.lock().unwrap();
+        if let Err(e) = db::upsert_user(&mut conn, uuid, &name) {
             tracing::warn!("failed to upsert user {}: {}", name, e);
         }
         db::log_event(&conn, "hello", None);
@@ -315,6 +467,22 @@ async fn hello(app: &Arc<App>, identity: &mut Option<Uuid>, tx: &Tx, conn_id: u6
     send(tx, json!({"op": "welcome", "uuid": uuid.to_string(), "name": name}).to_string()).await;
     send(tx, build_sync(app, &uuid).await).await;
     broadcast_presence(app, &uuid).await;
+}
+
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(out, "%{:02X}", b);
+            }
+        }
+    }
+    out
 }
 
 /// Can `viewer` see `session` (owned by `host`) in their friends / discoverable list?
@@ -358,6 +526,7 @@ async fn build_sync(app: &App, me: &Uuid) -> String {
             "presence": if online { "online" } else { "offline" },
             "hosting": visible_sess.is_some(),
             "worldName": visible_sess.map(|s| s.world_name.as_str()).unwrap_or(""),
+            "gameVersion": visible_sess.map(|s| s.game_version.as_str()).unwrap_or(""),
             "access": visible_sess.map(|s| s.access.as_str()).unwrap_or(""),
             "locked": visible_sess.map(|s| s.locked).unwrap_or(false),
             "playerCount": visible_sess.map(|s| s.player_count).unwrap_or(0),
@@ -400,6 +569,7 @@ async fn build_sync(app: &App, me: &Uuid) -> String {
                 "host": host_uuid.to_string(),
                 "hostName": host_name,
                 "worldName": sess.world_name,
+                "gameVersion": sess.game_version,
                 "access": sess.access.as_str(),
                 "source": source,
                 "viaName": via_name,
@@ -574,6 +744,12 @@ fn apply_session_fields(sess: &mut HostedSession, v: &Value) {
             sess.world_name = world.to_string();
         }
     }
+    if let Some(ver) = v.get("gameVersion").and_then(Value::as_str) {
+        let trimmed: String = ver.trim().chars().take(32).collect();
+        if !trimmed.is_empty() {
+            sess.game_version = trimmed;
+        }
+    }
     if let Some(access) = v.get("access").and_then(Value::as_str) {
         sess.access = AccessMode::parse(access);
     }
@@ -603,6 +779,7 @@ async fn session_open(app: &Arc<App>, me: &Uuid, _tx: &Tx, v: &Value) {
         let prev = sessions.get(me).cloned();
         let mut sess = prev.clone().unwrap_or_else(|| HostedSession {
             world_name: "a world".into(),
+            game_version: String::new(),
             access: AccessMode::Friends,
             invite_perm: InvitePerm::HostOnly,
             locked: false,
@@ -827,7 +1004,10 @@ async fn join_begin(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
         }
     };
 
-    let (room_id, host_token, joiner_token) = app.relay.create_room(app, *me);
+    let Some((room_id, host_token, joiner_token)) = app.relay.create_room(app, host, *me) else {
+        send(tx, error_op("that host has too many active connections right now")).await;
+        return;
+    };
     {
         let conn = app.db.lock().unwrap();
         db::log_event(&conn, "join_begin", None);
@@ -1109,6 +1289,7 @@ async fn push_session_state(app: &Arc<App>, me: &Uuid, prev: Option<&HostedSessi
                 "host": me.to_string(),
                 "hostName": host_name,
                 "worldName": if visible { curr.as_ref().map(|s| s.world_name.as_str()).unwrap_or("") } else { "" },
+                "gameVersion": if visible { curr.as_ref().map(|s| s.game_version.as_str()).unwrap_or("") } else { "" },
                 "active": visible,
                 "access": if visible { curr.as_ref().map(|s| s.access.as_str()).unwrap_or("") } else { "" },
                 "invitePerm": if visible { curr.as_ref().map(|s| s.invite_perm.as_str()).unwrap_or("") } else { "" },
