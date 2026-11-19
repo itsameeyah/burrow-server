@@ -220,6 +220,28 @@ async def main():
             await a.send(json.dumps({"op": "session.update", "access": "friends", "banned": []}))
             await recv_until(b, "session.state")
 
+        # --- rich presence (server name + ip) and invite.request ---
+        await a.send(json.dumps({
+            "op": "presence.update",
+            "activity": "server",
+            "serverName": "Meeyah SMP",
+            "serverIp": "play.meeyah.dev",
+            "label": "",
+        }))
+        pres_srv = await recv_until(
+            b, "presence.batch",
+            pred=lambda m: any(u.get("uuid") == a_uuid and u.get("activity") == "server"
+                               for u in m.get("updates", [])),
+        )
+        u0 = pres_srv["updates"][0]
+        check("B sees A playing on 'Meeyah SMP (play.meeyah.dev)'",
+              u0.get("serverName") == "Meeyah SMP" and u0.get("serverIp") == "play.meeyah.dev")
+
+        await b.send(json.dumps({"op": "invite.request", "uuid": a_uuid}))
+        req_inv = await recv_until(a, "invite.requested")
+        check("A received invite.requested from testbunny",
+              req_inv.get("from") == b_uuid and req_inv.get("fromName") == "testbunny")
+
         # --- wrong token is rejected ---
         try:
             bad = await websockets.connect(f"{RELAY}?room={ready['roomId']}&token=not-a-token")

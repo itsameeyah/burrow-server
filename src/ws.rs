@@ -80,11 +80,20 @@ pub struct HostedSession {
     pub banned: HashSet<Uuid>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct ClientActivity {
+    pub kind: String,        // "idle" | "singleplayer" | "server" | "local" | "multiplayer" | "burrow"
+    pub server_name: String, // saved server name (empty if hidden/direct-connect/incognito)
+    pub server_ip: String,   // joinable IP (empty if hidden/direct-connect/local/incognito)
+    pub label: String,       // extra display label (e.g. host name when in a Burrow world)
+}
+
 pub struct App {
     pub db: Mutex<rusqlite::Connection>,
     pub hub: hub::Hub,
     pub relay: relay::Relay,
     pub sessions: tokio::sync::Mutex<HashMap<Uuid, HostedSession>>,
+    pub activities: tokio::sync::Mutex<HashMap<Uuid, ClientActivity>>,
     pub dev_mode: bool,
     pub admin_token: Option<String>,
     /// Discord OAuth gate for the dashboard (all optional until configured).
@@ -150,8 +159,9 @@ async fn run_client(app: Arc<App>, socket: WebSocket) {
     // reconnect must not be evicted by this dying connection.
     if let Some(me) = identity {
         if app.hub.remove_owned(&me, conn_id).await.is_some() {
-            // A host that vanished takes its hosted-world session with it.
+            // A host that vanished takes its hosted-world session & activity with it.
             let prev_session = app.sessions.lock().await.remove(&me);
+            app.activities.lock().await.remove(&me);
             {
                 let conn = app.db.lock().unwrap();
                 db::log_event(&conn, "disconnect", None);
@@ -212,6 +222,14 @@ async fn handle_message(
         },
         "session.invite" => match identity {
             Some(me) => session_invite(app, me, tx, v).await,
+            None => send(tx, error_op("say hello first")).await,
+        },
+        "presence.update" => match identity {
+            Some(me) => presence_update(app, me, v).await,
+            None => send(tx, error_op("say hello first")).await,
+        },
+        "invite.request" => match identity {
+            Some(me) => invite_request(app, me, tx, v).await,
             None => send(tx, error_op("say hello first")).await,
         },
         "join.begin" => match identity {
@@ -303,6 +321,7 @@ async fn build_sync(app: &App, me: &Uuid) -> String {
     };
 
     let sessions: HashMap<Uuid, HostedSession> = app.sessions.lock().await.clone();
+    let activities: HashMap<Uuid, ClientActivity> = app.activities.lock().await.clone();
     let friend_set: HashSet<Uuid> = friend_pairs.iter().map(|(u, _)| *u).collect();
     let fof_map: HashMap<Uuid, String> = fof_pairs.into_iter().collect();
 
@@ -310,6 +329,11 @@ async fn build_sync(app: &App, me: &Uuid) -> String {
     for (u, name) in &friend_pairs {
         let online = app.hub.is_online(u).await;
         let visible_sess = sessions.get(u).filter(|s| visible_to_friend(s, me));
+        let act = if online {
+            activities.get(u).cloned().unwrap_or_default()
+        } else {
+            ClientActivity::default()
+        };
         friends.push(json!({
             "uuid": u.to_string(),
             "name": name,
@@ -320,6 +344,10 @@ async fn build_sync(app: &App, me: &Uuid) -> String {
             "locked": visible_sess.map(|s| s.locked).unwrap_or(false),
             "playerCount": visible_sess.map(|s| s.player_count).unwrap_or(0),
             "maxPlayers": visible_sess.map(|s| s.max_players).unwrap_or(0),
+            "activity": act.kind,
+            "serverName": act.server_name,
+            "serverIp": act.server_ip,
+            "activityLabel": act.label,
         }));
     }
 
@@ -815,6 +843,71 @@ async fn join_begin(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
     .await;
 }
 
+async fn presence_update(app: &Arc<App>, me: &Uuid, v: &Value) {
+    let clamp_str = |key: &str, max_len: usize| -> String {
+        v.get(key)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .chars()
+            .take(max_len)
+            .collect()
+    };
+    let kind = clamp_str("activity", 24);
+    let server_name = clamp_str("serverName", 64);
+    let server_ip = clamp_str("serverIp", 128);
+    let label = clamp_str("label", 64);
+
+    app.activities.lock().await.insert(
+        *me,
+        ClientActivity { kind, server_name, server_ip, label },
+    );
+    push_presence_to_friends(app, me).await;
+}
+
+async fn invite_request(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
+    let Some(target) = uuid_field(v) else {
+        send(tx, error_op("invite.request requires a uuid")).await;
+        return;
+    };
+    if target == *me {
+        return;
+    }
+    let friends = {
+        let conn = app.db.lock().unwrap();
+        db::are_friends(&conn, me, &target)
+    };
+    if !friends {
+        send(tx, error_op("you can only request invites from friends")).await;
+        return;
+    }
+    let Some(target_tx) = app.hub.tx(&target).await else {
+        send(tx, error_op("that friend is offline")).await;
+        return;
+    };
+    let my_name = match app.hub.name(me).await {
+        Some(n) => n,
+        None => {
+            let conn = app.db.lock().unwrap();
+            db::user_name_by_uuid(&conn, me).unwrap_or_else(|| "?".into())
+        }
+    };
+    {
+        let conn = app.db.lock().unwrap();
+        db::log_event(&conn, "invite_request", None);
+    }
+    send(
+        &target_tx,
+        json!({
+            "op": "invite.requested",
+            "from": me.to_string(),
+            "fromName": my_name,
+        })
+        .to_string(),
+    )
+    .await;
+}
+
 /// Tell all my online friends what my presence currently looks like.
 async fn broadcast_presence(app: &Arc<App>, me: &Uuid) {
     push_presence_to_friends(app, me).await;
@@ -827,6 +920,11 @@ async fn push_presence_to_friends(app: &Arc<App>, me: &Uuid) {
     };
     let online = app.hub.is_online(me).await;
     let sess = app.sessions.lock().await.get(me).cloned();
+    let act = if online {
+        app.activities.lock().await.get(me).cloned().unwrap_or_default()
+    } else {
+        ClientActivity::default()
+    };
     for friend in friends {
         if friend == *me {
             continue;
@@ -839,6 +937,10 @@ async fn push_presence_to_friends(app: &Arc<App>, me: &Uuid) {
                 "presence": if online { "online" } else { "offline" },
                 "hosting": visible.is_some(),
                 "worldName": visible.map(|s| s.world_name.as_str()).unwrap_or(""),
+                "activity": act.kind,
+                "serverName": act.server_name,
+                "serverIp": act.server_ip,
+                "activityLabel": act.label,
             }]
         })
         .to_string();

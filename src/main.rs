@@ -30,6 +30,7 @@ async fn main() {
         hub: hub::Hub::new(),
         relay: relay::Relay::new(),
         sessions: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        activities: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         dev_mode,
         admin_token,
         discord_client_id,
