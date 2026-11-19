@@ -4,21 +4,30 @@ services:
     container_name: burrow
     restart: unless-stopped
     ports:
-      # LAN phase only — this mapping goes away when the cloudflared
-      # sidecar takes over in phase 2.
+      # Exposed on port 8787 (reachable on LAN & from a host reverse proxy).
+      # If using a cloudflared sidecar on the same compose network, you can
+      # switch this to "127.0.0.1:8787:8787" or remove ports entirely.
       - "8787:8787"
     volumes:
-      - ./data:/data
+      - burrow-data:/data
     environment:
-      # Dev identities are accepted during the LAN testing phase.
-      # Flip to "0" once real Microsoft auth lands.
-      BURROW_DEV_MODE: "1"
-      # Optional static bearer token for scripts / headless checks:
-      # BURROW_ADMIN_TOKEN: ""
-      # Discord OAuth gate for /admin (fill all four to enable):
-      # BURROW_DISCORD_CLIENT_ID: ""
-      # BURROW_DISCORD_CLIENT_SECRET: ""
-      # BURROW_DISCORD_REDIRECT_URI: "http://192.168.0.126:8787/admin/callback"
-      # BURROW_DISCORD_ALLOWED_USER_ID: ""
-      # Flip to "1" once served over HTTPS (Cloudflare Tunnel phase):
-      # BURROW_SECURE_COOKIES: "0"
+      BURROW_DEV_MODE: "${BURROW_DEV_MODE:-0}"
+      BURROW_ADMIN_TOKEN: "${BURROW_ADMIN_TOKEN:-}"
+      BURROW_DISCORD_CLIENT_ID: "${BURROW_DISCORD_CLIENT_ID:-}"
+      BURROW_DISCORD_CLIENT_SECRET: "${BURROW_DISCORD_CLIENT_SECRET:-}"
+      BURROW_DISCORD_REDIRECT_URI: "${BURROW_DISCORD_REDIRECT_URI:-https://burrow.meeyah.dev/admin/callback}"
+      BURROW_DISCORD_ALLOWED_USER_ID: "${BURROW_DISCORD_ALLOWED_USER_ID:-}"
+      BURROW_SECURE_COOKIES: "${BURROW_SECURE_COOKIES:-1}"
+
+  # Optional Cloudflare Tunnel sidecar — uncomment & set CLOUDFLARED_TOKEN in .env
+  # if you choose the Cloudflare Tunnel option:
+  # cloudflared:
+  #   image: cloudflare/cloudflared:latest
+  #   container_name: burrow-cloudflared
+  #   restart: unless-stopped
+  #   command: tunnel --no-autoupdate run --token ${CLOUDFLARED_TOKEN}
+  #   depends_on:
+  #     - burrow
+
+volumes:
+  burrow-data:
