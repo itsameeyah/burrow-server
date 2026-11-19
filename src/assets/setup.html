@@ -3,38 +3,63 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Burrow — setup</title>
+<title>burrow setup</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Quicksand:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
-:root { --bg:#fff0f7; --text:#9e3f77; --card-bg:#fff; --header-text:#c2427f; --drawer-bg:#ffd6e7; --muted:#a34f81; --radius:12px; }
-body { background:var(--bg); color:var(--text); font-family:'Quicksand',Arial,sans-serif; margin:0; padding:40px 16px; }
-.wrap { max-width: 640px; margin: 0 auto; }
-h1 { color:var(--header-text); font-weight:700; font-size:24px; margin:0 0 6px; }
-.card { background:var(--card-bg); border-radius:var(--radius); padding:20px 22px; box-shadow:0 6px 18px rgba(158,63,119,.10); }
-code { background:var(--drawer-bg); padding:2px 6px; border-radius:6px; font-size:13px; }
-li { margin: 8px 0; line-height: 1.45; }
-.muted { color:var(--muted); font-size:13px; }
+:root {
+    --bg: #fff0f7;
+    --text: #9e3f77;
+    --header-bg: #ffffff;
+    --header-text: #c2427f;
+    --drawer-bg: #ffd6e7;
+    --text-muted: #a34f81;
+    --radius: 12px;
+}
+* { box-sizing: border-box; }
+body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Quicksand', Arial, sans-serif;
+    margin: 0;
+    padding: 40px 24px;
+}
+.container { max-width: 640px; margin: 0 auto; }
+h1 { color: var(--header-text); font-weight: 700; font-size: 26px; margin: 0 0 6px; line-height: 1; }
+.sub { color: var(--text-muted); font-size: 14px; margin: 0 0 20px; }
+.card {
+    background: var(--header-bg);
+    border-radius: var(--radius);
+    padding: 20px 22px;
+    box-shadow: 0 8px 24px rgba(158, 63, 119, 0.08);
+}
+code {
+    background: var(--drawer-bg);
+    color: var(--header-text);
+    padding: 2px 6px;
+    border-radius: 6px;
+    font-size: 13px;
+}
+ol { padding-left: 20px; margin: 12px 0; }
+li { margin: 10px 0; line-height: 1.5; font-size: 14px; }
+.muted { color: var(--text-muted); font-size: 13px; margin-bottom: 0; }
 </style>
 </head>
 <body>
-<div class="wrap">
-    <h1>🐇 Burrow — dashboard setup</h1>
+<main class="container">
+    <h1>burrow</h1>
+    <p class="sub">dashboard setup</p>
     <div class="card">
-        <p>The dashboard is Discord-gated so only Mia can open it. To finish wiring it up:</p>
+        <p style="margin-top:0">configure discord oauth2 to enable admin login:</p>
         <ol>
-            <li>Create an application at <code>discord.com/developers/applications</code> → OAuth2.</li>
-            <li>Add redirect URIs:<br>
-                <code>https://burrow.meeyah.dev/admin/callback</code> (tunnel phase)<br>
-                <code>http://192.168.0.126:8787/admin/callback</code> (LAN phase)</li>
-            <li>Set these on the Burrow server:<br>
-                <code>BURROW_DISCORD_CLIENT_ID</code><br>
-                <code>BURROW_DISCORD_CLIENT_SECRET</code><br>
-                <code>BURROW_DISCORD_REDIRECT_URI</code> (one of the above)<br>
-                <code>BURROW_DISCORD_ALLOWED_USER_ID</code> (your Discord user id — the one and only account that may sign in)</li>
-            <li>Restart the server and reload this page — it will send you through Discord sign-in.</li>
+            <li>create an application at <code>discord.com/developers/applications</code> under oauth2.</li>
+            <li>add the redirect url <code>https://burrow.meeyah.dev/admin/callback</code>.</li>
+            <li>set <code>BURROW_DISCORD_CLIENT_ID</code>, <code>BURROW_DISCORD_CLIENT_SECRET</code>, <code>BURROW_DISCORD_REDIRECT_URI</code>, and <code>BURROW_DISCORD_ALLOWED_USER_ID</code> in <code>.env</code>.</li>
+            <li>restart the container and reload this page.</li>
         </ol>
-        <p class="muted">Until then this page exists only on your LAN / behind your token, and metrics are counts-only regardless.</p>
+        <p class="muted">all metrics endpoints remain hidden until sign-in is configured.</p>
     </div>
-</div>
+</main>
 </body>
 </html>

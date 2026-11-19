@@ -53,6 +53,7 @@ async fn main() {
         .route("/relay/ws", axum::routing::get(relay::relay_handler))
         .route("/admin", axum::routing::get(dashboard::admin_page))
         .route("/admin/callback", axum::routing::get(dashboard::oauth_callback))
+        .route("/admin/logout", axum::routing::get(dashboard::logout))
         .route("/api/metrics", axum::routing::get(dashboard::metrics))
         .route("/api/metrics/history", axum::routing::get(dashboard::metrics_history))
         .with_state(app.clone());

@@ -3,122 +3,646 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Burrow — mission control</title>
+<title>burrow</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Quicksand:wght@400;500;700&display=swap" rel="stylesheet">
+{{UPLOT_CSS}}
 <style>
 :root {
     --bg: #fff0f7;
     --text: #9e3f77;
-    --card-bg: #ffffff;
+    --header-bg: #ffffff;
     --header-text: #c2427f;
     --drawer-bg: #ffd6e7;
     --text-muted: #a34f81;
     --radius: 12px;
+    --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+    --shadow: 0 8px 24px rgba(158, 63, 119, 0.08);
+    --shadow-hover: 0 12px 28px rgba(158, 63, 119, 0.13);
+    --hairline: rgba(158, 63, 119, 0.12);
 }
+
 * { box-sizing: border-box; }
-body {
+
+html, body {
+    margin: 0;
+    padding: 0;
+    min-height: 100%;
     background: var(--bg);
     color: var(--text);
     font-family: 'Quicksand', Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+}
+
+.bg-canvas {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 0;
+    pointer-events: none;
+}
+
+.container {
+    position: relative;
+    z-index: 1;
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 36px 24px 72px;
+}
+
+/* page head matches meeyah.dev's .page-head rhythm */
+.page-head {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+    margin-bottom: 24px;
+}
+
+.brand h1 {
     margin: 0;
-    padding: 32px 16px 64px;
+    color: var(--header-text);
+    font-size: 30px;
+    font-weight: 700;
+    line-height: 1;
+    letter-spacing: -0.01em;
 }
-.blobs { position: fixed; inset: 0; z-index: -1; overflow: hidden; }
-.blobs div { position: absolute; border-radius: 50%; background: var(--drawer-bg); opacity: 0.25; }
-.b1 { width: 55vmin; height: 55vmin; top: -10vmin; left: -15vmin; animation: drift 34s ease-in-out infinite alternate; }
-.b2 { width: 40vmin; height: 40vmin; bottom: -5vmin; right: -10vmin; animation: drift 46s ease-in-out infinite alternate-reverse; }
-.b3 { width: 26vmin; height: 26vmin; top: 40%; left: 60%; animation: drift 52s ease-in-out infinite alternate; }
-@keyframes drift { from { transform: translate(0, 0) scale(1); } to { transform: translate(6vmin, -4vmin) scale(1.15); } }
-.wrap { max-width: 880px; margin: 0 auto; }
-h1 { color: var(--header-text); font-weight: 700; font-size: 26px; margin: 0 0 4px; }
-.sub { color: var(--text-muted); margin: 0 0 24px; font-size: 14px; }
-.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; margin-bottom: 24px; }
+
+.brand p {
+    margin: 6px 0 0;
+    color: var(--text-muted);
+    font-size: 14px;
+    font-weight: 500;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--header-text);
+    display: inline-block;
+    transition: opacity 0.25s var(--ease-out);
+}
+
+.status-dot.stale {
+    background: var(--drawer-bg);
+    box-shadow: inset 0 0 0 1.5px var(--text-muted);
+}
+
+.head-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.pill-btn {
+    appearance: none;
+    border: 0;
+    background: var(--header-bg);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 700;
+    line-height: 1;
+    padding: 9px 14px;
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    text-decoration: none;
+    cursor: pointer;
+    transition: transform 0.25s var(--ease-out), background 0.25s var(--ease-out), color 0.25s var(--ease-out);
+}
+
+.pill-btn:hover {
+    transform: scale(1.03);
+    color: var(--header-text);
+}
+
+.pill-btn:active {
+    transform: scale(0.99);
+}
+
+/* metric tiles: 3 columns x 2 rows on desktop, 2 columns on mobile */
+.tiles {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 14px;
+    margin-bottom: 24px;
+}
+
 .tile {
-    background: var(--card-bg); border-radius: var(--radius);
-    padding: 14px 16px; box-shadow: 0 6px 18px rgba(158, 63, 119, 0.10);
+    background: var(--header-bg);
+    border-radius: var(--radius);
+    padding: 18px 20px;
+    box-shadow: var(--shadow);
+    transition: transform 0.25s var(--ease-out), box-shadow 0.25s var(--ease-out);
 }
-.tile .num { font-size: 24px; font-weight: 700; color: var(--header-text); }
-.tile .label { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+
+.tile:hover {
+    transform: scale(1.02);
+    box-shadow: var(--shadow-hover);
+}
+
+.tile-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.tile .label {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-muted);
+}
+
+.tile .live-pip {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--drawer-bg);
+    transition: background 0.25s var(--ease-out);
+}
+
+.tile.active .live-pip {
+    background: var(--header-text);
+}
+
+.tile .num {
+    font-size: 30px;
+    font-weight: 700;
+    line-height: 1.05;
+    color: var(--header-text);
+    font-variant-numeric: tabular-nums;
+}
+
+/* section toolbar above charts */
+.section-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin: 4px 0 12px;
+}
+
+.section-bar h2 {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--text);
+}
+
+.range-group {
+    display: inline-flex;
+    background: var(--header-bg);
+    padding: 4px;
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    gap: 4px;
+}
+
+.range-btn {
+    appearance: none;
+    border: 0;
+    background: transparent;
+    color: var(--text-muted);
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 700;
+    padding: 6px 11px;
+    border-radius: calc(var(--radius) - 4px);
+    cursor: pointer;
+    transition: background 0.25s var(--ease-out), color 0.25s var(--ease-out);
+}
+
+.range-btn:hover {
+    color: var(--header-text);
+}
+
+.range-btn.active {
+    background: var(--drawer-bg);
+    color: var(--header-text);
+}
+
+/* chart cards */
+.charts {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 16px;
+}
+
 .card {
-    background: var(--card-bg); border-radius: var(--radius);
-    padding: 18px 20px 14px; margin-bottom: 20px;
-    box-shadow: 0 6px 18px rgba(158, 63, 119, 0.10);
+    background: var(--header-bg);
+    border-radius: var(--radius);
+    padding: 20px 22px 16px;
+    box-shadow: var(--shadow);
 }
-.card h2 { font-size: 15px; color: var(--header-text); margin: 0 0 10px; font-weight: 500; }
-.foot { color: var(--text-muted); font-size: 12px; text-align: center; margin-top: 8px; }
-.uplot { font-family: 'Quicksand', Arial, sans-serif; }
-.u-legend { display: none !important; }
+
+.card-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+}
+
+.card-head h3 {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--header-text);
+}
+
+.card-readout {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+}
+
+.chart-host {
+    width: 100%;
+    min-height: 196px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.chart-empty {
+    color: var(--text-muted);
+    font-size: 13px;
+    font-weight: 500;
+}
+
+.uplot {
+    font-family: 'Quicksand', Arial, sans-serif;
+    width: 100%;
+}
+
+.u-legend {
+    display: none !important;
+}
+
+.foot {
+    margin: 28px 0 0;
+    text-align: center;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-muted);
+}
+
+.foot a {
+    color: var(--text-muted);
+    text-decoration: none;
+}
+
+.foot a:hover {
+    color: var(--header-text);
+}
+
+@media (max-width: 640px) {
+    .container { padding: 24px 16px 56px; }
+    .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .tile { padding: 14px 16px; }
+    .tile .num { font-size: 24px; }
+    .card { padding: 16px 16px 12px; }
+}
 </style>
-{{UPLOT_CSS}}
 </head>
 <body>
-<div class="blobs"><div class="b1"></div><div class="b2"></div><div class="b3"></div></div>
-<div class="wrap">
-    <h1>🐇 Burrow — mission control</h1>
-    <p class="sub">aggregated counts only — safe to screenshot anywhere</p>
+<canvas class="bg-canvas" id="bg-canvas" aria-hidden="true"></canvas>
 
-    <div class="tiles">
-        <div class="tile"><div class="num" id="t-users_total">–</div><div class="label">lifetime users</div></div>
-        <div class="tile"><div class="num" id="t-online_now">–</div><div class="label">online now</div></div>
-        <div class="tile"><div class="num" id="t-active_sessions">–</div><div class="label">active worlds</div></div>
-        <div class="tile"><div class="num" id="t-friendships_total">–</div><div class="label">friendships</div></div>
-        <div class="tile"><div class="num" id="t-relay_rooms">–</div><div class="label">relay rooms</div></div>
-        <div class="tile"><div class="num" id="t-events_24h">–</div><div class="label">events (24h)</div></div>
+<main class="container">
+    <div class="page-head">
+        <div class="brand">
+            <h1>burrow</h1>
+            <p>
+                <span class="status-dot" id="status-dot"></span>
+                <span id="status-text">connecting...</span>
+            </p>
+        </div>
+        <div class="head-actions">
+            <a class="pill-btn" href="/admin/logout">sign out</a>
+        </div>
     </div>
 
-    <div class="card">
-        <h2>activity — events per day (30 days)</h2>
-        <div id="chart-events"></div>
+    <section class="tiles" aria-label="live server counts">
+        <div class="tile" id="card-online_now">
+            <div class="tile-top"><span class="label">online now</span><span class="live-pip"></span></div>
+            <div class="num" id="t-online_now">-</div>
+        </div>
+        <div class="tile" id="card-active_sessions">
+            <div class="tile-top"><span class="label">active worlds</span><span class="live-pip"></span></div>
+            <div class="num" id="t-active_sessions">-</div>
+        </div>
+        <div class="tile" id="card-relay_rooms">
+            <div class="tile-top"><span class="label">relay rooms</span><span class="live-pip"></span></div>
+            <div class="num" id="t-relay_rooms">-</div>
+        </div>
+        <div class="tile">
+            <div class="tile-top"><span class="label">lifetime users</span></div>
+            <div class="num" id="t-users_total">-</div>
+        </div>
+        <div class="tile">
+            <div class="tile-top"><span class="label">friendships</span></div>
+            <div class="num" id="t-friendships_total">-</div>
+        </div>
+        <div class="tile">
+            <div class="tile-top"><span class="label">events (24h)</span></div>
+            <div class="num" id="t-events_24h">-</div>
+        </div>
+    </section>
+
+    <div class="section-bar">
+        <h2>history</h2>
+        <div class="range-group" role="group" aria-label="history range">
+            <button class="range-btn" data-days="7">7d</button>
+            <button class="range-btn active" data-days="30">30d</button>
+            <button class="range-btn" data-days="90">90d</button>
+        </div>
     </div>
-    <div class="card">
-        <h2>growth — lifetime users</h2>
-        <div id="chart-users"></div>
-    </div>
-    <p class="foot">burrow · meeyah.dev</p>
-</div>
+
+    <section class="charts">
+        <div class="card">
+            <div class="card-head">
+                <h3>daily events</h3>
+                <span class="card-readout" id="readout-events">loading...</span>
+            </div>
+            <div class="chart-host" id="chart-events"></div>
+        </div>
+
+        <div class="card">
+            <div class="card-head">
+                <h3>lifetime users</h3>
+                <span class="card-readout" id="readout-users">loading...</span>
+            </div>
+            <div class="chart-host" id="chart-users"></div>
+        </div>
+    </section>
+
+    <p class="foot">burrow · <a href="https://meeyah.dev">meeyah.dev</a></p>
+</main>
+
 <script>{{UPLOT_JS}}</script>
 <script>
-function refreshTiles() {
-    fetch('/api/metrics').then(r => r.json()).then(m => {
-        for (const [k, v] of Object.entries(m)) {
-            const el = document.getElementById('t-' + k);
-            if (el) el.textContent = v;
+// seeded crisp pastel circles matching meeyah.dev's background.js aesthetic
+(function initBackground() {
+    const canvas = document.getElementById('bg-canvas');
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const styles = getComputedStyle(document.documentElement);
+    const circleColor = styles.getPropertyValue('--drawer-bg').trim() || '#ffd6e7';
+    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    function mulberry32(seed) {
+        return function() {
+            let t = seed += 0x6D2B79F5;
+            t = Math.imul(t ^ (t >>> 15), t | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        };
+    }
+
+    const rand = mulberry32(0xB04407);
+    const circles = Array.from({ length: 7 }, () => ({
+        bx: rand(),
+        by: rand(),
+        r: 0.14 + rand() * 0.22,
+        ax: 0.04 + rand() * 0.06,
+        ay: 0.04 + rand() * 0.06,
+        px: rand() * Math.PI * 2,
+        py: rand() * Math.PI * 2,
+        wx: (Math.PI * 2) / (65 + rand() * 110),
+        wy: (Math.PI * 2) / (75 + rand() * 115),
+    }));
+
+    function resize() {
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        canvas.width = Math.floor(window.innerWidth * dpr);
+        canvas.height = Math.floor(window.innerHeight * dpr);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+
+    function draw(ts) {
+        const t = ts / 1000;
+        const w = window.innerWidth;
+        const h = window.innerHeight;
+        const base = Math.min(w, h);
+        ctx.clearRect(0, 0, w, h);
+        ctx.fillStyle = circleColor;
+        ctx.globalAlpha = 0.25;
+        for (const c of circles) {
+            const x = (c.bx + Math.sin(t * c.wx + c.px) * c.ax) * w;
+            const y = (c.by + Math.cos(t * c.wy + c.py) * c.ay) * h;
+            ctx.beginPath();
+            ctx.arc(x, y, c.r * base, 0, Math.PI * 2);
+            ctx.fill();
         }
-    }).catch(() => {});
+        ctx.globalAlpha = 1;
+        if (!reduceMotion) requestAnimationFrame(draw);
+    }
+
+    resize();
+    window.addEventListener('resize', () => {
+        resize();
+        if (reduceMotion) draw(0);
+    });
+    draw(0);
+})();
+
+const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+function formatDay(sec) {
+    const d = new Date(sec * 1000);
+    return MONTHS[d.getUTCMonth()] + ' ' + d.getUTCDate();
 }
+
+function formatTime(d) {
+    const pad = n => String(n).padStart(2, '0');
+    return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+}
+
+const statusDot = document.getElementById('status-dot');
+const statusText = document.getElementById('status-text');
+
+function refreshTiles() {
+    fetch('/api/metrics', { cache: 'no-store' })
+        .then(r => {
+            if (!r.ok) throw new Error('status ' + r.status);
+            return r.json();
+        })
+        .then(m => {
+            for (const [k, v] of Object.entries(m)) {
+                const el = document.getElementById('t-' + k);
+                if (el) el.textContent = v;
+                const card = document.getElementById('card-' + k);
+                if (card) card.classList.toggle('active', Number(v) > 0);
+            }
+            statusDot.classList.remove('stale');
+            statusText.textContent = 'live · updated ' + formatTime(new Date());
+        })
+        .catch(() => {
+            statusDot.classList.add('stale');
+            statusText.textContent = 'reconnecting...';
+        });
+}
+
 refreshTiles();
 setInterval(refreshTiles, 5000);
 
-const plots = [];
-fetch('/api/metrics/history?days=30').then(r => r.json()).then(h => {
-    function makeChart(container, data, color) {
-        if (!data || !data[0] || data[0].length < 2) { container.textContent = 'not enough history yet 🙂'; return; }
-        const plot = new uPlot({
-            width: Math.max(container.clientWidth - 8, 240),
-            height: 200,
-            legend: { show: false },
-            series: [
-                {},
-                { stroke: color, fill: color + '22', width: 2 }
-            ],
-            axes: [
-                {},
-                { values: (u, vals) => vals.map(v => Number.isInteger(v) ? String(v) : '') }
-            ],
-            scales: { x: { time: true } },
-            cursor: { drag: { x: false, y: false } }
-        }, data, container);
-        plots.push({ plot, container });
+const styles = getComputedStyle(document.documentElement);
+const COLOR_HEADER = styles.getPropertyValue('--header-text').trim() || '#c2427f';
+const COLOR_TEXT = styles.getPropertyValue('--text').trim() || '#9e3f77';
+const COLOR_MUTED = styles.getPropertyValue('--text-muted').trim() || '#a34f81';
+
+let activePlots = [];
+let currentDays = 30;
+
+function destroyPlots() {
+    for (const entry of activePlots) {
+        entry.plot.destroy();
     }
-    makeChart(document.getElementById('chart-events'), h.events, '#c2427f');
-    makeChart(document.getElementById('chart-users'), h.usersTotal, '#9e3f77');
-}).catch(() => {});
+    activePlots = [];
+}
+
+function makeChart(container, readoutEl, data, color, unit, mode) {
+    container.innerHTML = '';
+    if (!data || !data[0] || data[0].length < 2) {
+        container.innerHTML = '<div class="chart-empty">no history in this range yet</div>';
+        readoutEl.textContent = '0 ' + unit;
+        return;
+    }
+
+    const values = data[1];
+    const defaultSummary = mode === 'sum'
+        ? values.reduce((a, b) => a + b, 0) + ' ' + unit + ' total'
+        : values[values.length - 1] + ' ' + unit;
+    readoutEl.textContent = defaultSummary;
+
+    const width = Math.max(container.clientWidth, 240);
+    const plot = new uPlot({
+        width,
+        height: 196,
+        padding: [10, 8, 0, 0],
+        legend: { show: false },
+        cursor: {
+            drag: { x: false, y: false },
+            points: {
+                size: 7,
+                fill: '#ffffff',
+                stroke: color,
+                width: 2,
+            },
+        },
+        scales: {
+            x: { time: true },
+            y: {
+                auto: true,
+                range: (u, min, max) => [0, Math.max(max * 1.15, 4)],
+            },
+        },
+        axes: [
+            {
+                stroke: COLOR_MUTED,
+                font: '500 11px Quicksand, Arial, sans-serif',
+                grid: { show: false },
+                ticks: { show: false },
+                values: (u, vals) => vals.map(formatDay),
+            },
+            {
+                stroke: COLOR_MUTED,
+                font: '500 11px Quicksand, Arial, sans-serif',
+                size: 38,
+                grid: { stroke: 'rgba(158, 63, 119, 0.10)', width: 1 },
+                ticks: { show: false },
+                values: (u, vals) => vals.map(v => Number.isInteger(v) ? String(v) : ''),
+            },
+        ],
+        series: [
+            {},
+            {
+                stroke: color,
+                width: 2.5,
+                fill: (u) => {
+                    const grad = u.ctx.createLinearGradient(0, 0, 0, u.bbox.height);
+                    grad.addColorStop(0, color + '36');
+                    grad.addColorStop(1, color + '04');
+                    return grad;
+                },
+            },
+        ],
+        hooks: {
+            setCursor: [
+                (u) => {
+                    const idx = u.cursor.idx;
+                    if (idx == null || data[0][idx] == null) {
+                        readoutEl.textContent = defaultSummary;
+                        return;
+                    }
+                    readoutEl.textContent = formatDay(data[0][idx]) + ' · ' + data[1][idx] + ' ' + unit;
+                },
+            ],
+        },
+    }, data, container);
+
+    activePlots.push({ plot, container });
+}
+
+function loadHistory(days) {
+    currentDays = days;
+    fetch('/api/metrics/history?days=' + days, { cache: 'no-store' })
+        .then(r => {
+            if (!r.ok) throw new Error('status ' + r.status);
+            return r.json();
+        })
+        .then(h => {
+            destroyPlots();
+            makeChart(
+                document.getElementById('chart-events'),
+                document.getElementById('readout-events'),
+                h.events,
+                COLOR_HEADER,
+                'events',
+                'sum'
+            );
+            makeChart(
+                document.getElementById('chart-users'),
+                document.getElementById('readout-users'),
+                h.usersTotal,
+                COLOR_TEXT,
+                'users',
+                'latest'
+            );
+        })
+        .catch(() => {
+            document.getElementById('readout-events').textContent = 'unavailable';
+            document.getElementById('readout-users').textContent = 'unavailable';
+        });
+}
+
+for (const btn of document.querySelectorAll('.range-btn')) {
+    btn.addEventListener('click', () => {
+        const days = Number(btn.dataset.days);
+        if (days === currentDays) return;
+        for (const b of document.querySelectorAll('.range-btn')) {
+            b.classList.toggle('active', b === btn);
+        }
+        loadHistory(days);
+    });
+}
+
+loadHistory(currentDays);
 
 window.addEventListener('resize', () => {
-    for (const { plot, container } of plots) {
-        plot.setSize({ width: Math.max(container.clientWidth - 8, 240), height: 200 });
+    for (const { plot, container } of activePlots) {
+        plot.setSize({ width: Math.max(container.clientWidth, 240), height: 196 });
     }
 });
 </script>

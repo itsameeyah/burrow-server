@@ -104,6 +104,49 @@ fn not_found() -> Response {
     StatusCode::NOT_FOUND.into_response()
 }
 
+fn error_page(status: StatusCode, message: &str) -> Response {
+    let body = format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+        <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+        <title>burrow</title>\
+        <link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">\
+        <link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>\
+        <link href=\"https://fonts.googleapis.com/css2?family=Quicksand:wght@500;700&display=swap\" rel=\"stylesheet\">\
+        <style>:root{{--bg:#fff0f7;--text:#9e3f77;--header-bg:#fff;--header-text:#c2427f;--radius:12px}}\
+        body{{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:var(--bg);color:var(--text);font-family:'Quicksand',Arial,sans-serif}}\
+        .card{{background:var(--header-bg);border-radius:var(--radius);padding:24px 28px;max-width:420px;text-align:center;box-shadow:0 8px 24px rgba(158,63,119,.08)}}\
+        h1{{margin:0 0 8px;font-size:20px;color:var(--header-text)}}p{{margin:0 0 16px;font-size:14px}}\
+        a{{display:inline-block;padding:8px 14px;border-radius:var(--radius);background:#ffd6e7;color:var(--header-text);font-weight:700;font-size:13px;text-decoration:none}}</style>\
+        </head><body><div class=\"card\"><h1>burrow</h1><p>{}</p><a href=\"/admin\">try again</a></div></body></html>",
+        message
+    );
+    (status, Html(body)).into_response()
+}
+
+/// GET /admin/logout — revoke the session cookie and head back to meeyah.dev.
+pub async fn logout(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    if let Some(token) = cookie_value(&headers, "burrow_session") {
+        app.dash_sessions.lock().await.remove(&token);
+    }
+    let secure = std::env::var("BURROW_SECURE_COOKIES")
+        .map(|v| matches!(v.trim(), "1" | "true"))
+        .unwrap_or(false);
+    let mut cookie = "burrow_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0".to_string();
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    let mut headers_out = HeaderMap::new();
+    let _ = headers_out.insert(
+        header::SET_COOKIE,
+        axum::http::HeaderValue::from_str(&cookie).expect("valid cookie header"),
+    );
+    let _ = headers_out.insert(
+        header::LOCATION,
+        axum::http::HeaderValue::from_static("https://meeyah.dev"),
+    );
+    (StatusCode::FOUND, headers_out).into_response()
+}
+
 /// GET /admin — the gate itself.
 pub async fn admin_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     if dash_authed(&app, &headers).await {
@@ -165,7 +208,7 @@ pub async fn oauth_callback(
         return not_found();
     }
     let (Some(code), Some(state)) = (params.get("code"), params.get("state")) else {
-        return Html("<h3>missing code/state 🐇</h3>").into_response();
+        return error_page(StatusCode::BAD_REQUEST, "missing login parameters");
     };
 
     // Consume the CSRF state.
@@ -177,7 +220,7 @@ pub async fn oauth_callback(
         };
         states.remove(state);
         if !valid {
-            return Html("<h3>login window expired — try again</h3>").into_response();
+            return error_page(StatusCode::BAD_REQUEST, "login window expired");
         }
     }
 
@@ -199,14 +242,14 @@ pub async fn oauth_callback(
         .send()
         .await;
     let Ok(token_res) = token_res else {
-        return Html("<h3>could not reach Discord</h3>").into_response();
+        return error_page(StatusCode::BAD_GATEWAY, "could not reach discord");
     };
     if !token_res.status().is_success() {
         tracing::warn!("discord token exchange failed: {}", token_res.status());
-        return Html("<h3>Discord rejected the login</h3>").into_response();
+        return error_page(StatusCode::BAD_GATEWAY, "discord rejected the login");
     }
     let Ok(token_json) = token_res.json::<Value>().await else {
-        return Html("<h3>unexpected response from Discord</h3>").into_response();
+        return error_page(StatusCode::BAD_GATEWAY, "unexpected response from discord");
     };
     let access_token = token_json
         .get("access_token")
@@ -214,7 +257,7 @@ pub async fn oauth_callback(
         .unwrap_or_default()
         .to_string();
     if access_token.is_empty() {
-        return Html("<h3>Discord did not return an access token</h3>").into_response();
+        return error_page(StatusCode::BAD_GATEWAY, "discord did not return an access token");
     }
 
     // Who is signing in?
@@ -225,14 +268,14 @@ pub async fn oauth_callback(
         .send()
         .await;
     let Ok(me_res) = me_res else {
-        return Html("<h3>could not read your Discord profile</h3>").into_response();
+        return error_page(StatusCode::BAD_GATEWAY, "could not read your discord profile");
     };
     if !me_res.status().is_success() {
         tracing::warn!("discord @me request failed: {}", me_res.status());
-        return Html("<h3>Discord rejected the profile lookup</h3>").into_response();
+        return error_page(StatusCode::BAD_GATEWAY, "discord rejected the profile lookup");
     }
     let Ok(me) = me_res.json::<Value>().await else {
-        return Html("<h3>unexpected profile response</h3>").into_response();
+        return error_page(StatusCode::BAD_GATEWAY, "unexpected profile response");
     };
     let user_id = me
         .get("id")
@@ -243,8 +286,7 @@ pub async fn oauth_callback(
     // THE allowlist: exactly one account may ever pass this gate.
     if user_id.is_empty() || user_id != app.discord_allowed_user_id.clone().unwrap_or_default() {
         tracing::warn!("dashboard login attempt by discord id {}", user_id);
-        return Html("<h3>this dashboard isn't for you 🐇</h3>")
-            .into_response();
+        return error_page(StatusCode::FORBIDDEN, "this account is not authorized");
     }
 
     // Issue a session cookie. SameSite always; Secure when the operator
