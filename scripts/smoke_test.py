@@ -242,6 +242,17 @@ async def main():
         check("A received invite.requested from testbunny",
               req_inv.get("from") == b_uuid and req_inv.get("fromName") == "testbunny")
 
+        await b.send(json.dumps({
+            "op": "users.check",
+            "uuids": [a_uuid, str(uuid.uuid4())],
+            "names": ["meeyah", "nobody_has_burrow"],
+        }))
+        chk = await recv_until(b, "users.check.result")
+        check("users.check identifies registered Burrow players and excludes others",
+              a_uuid in chk.get("uuids", [])
+              and "meeyah" in chk.get("names", [])
+              and "nobody_has_burrow" not in chk.get("names", []))
+
         # --- wrong token is rejected ---
         try:
             bad = await websockets.connect(f"{RELAY}?room={ready['roomId']}&token=not-a-token")

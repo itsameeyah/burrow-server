@@ -246,6 +246,10 @@ async fn handle_message(
             Some(me) => invite_request(app, me, tx, v).await,
             None => send(tx, error_op("say hello first")).await,
         },
+        "users.check" => match identity {
+            Some(_) => users_check(app, tx, v).await,
+            None => send(tx, error_op("say hello first")).await,
+        },
         "join.begin" => match identity {
             Some(me) => join_begin(app, me, tx, v).await,
             None => send(tx, error_op("say hello first")).await,
@@ -918,6 +922,63 @@ async fn invite_request(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
             "op": "invite.requested",
             "from": me.to_string(),
             "fromName": my_name,
+        })
+        .to_string(),
+    )
+    .await;
+}
+
+/// Check which of a bounded list of players on the caller's Minecraft server
+/// have registered Burrow accounts, so the mod can highlight addable players
+/// and grey out non-Burrow players.
+async fn users_check(app: &Arc<App>, tx: &Tx, v: &Value) {
+    let uuids: Vec<Uuid> = v
+        .get("uuids")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .take(128)
+                .filter_map(Value::as_str)
+                .filter_map(|s| Uuid::parse_str(s).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let names: Vec<String> = v
+        .get("names")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .take(128)
+                .filter_map(Value::as_str)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty() && s.len() <= 32)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let (found_uuids, found_names) = {
+        let conn = app.db.lock().unwrap();
+        let mut fu: Vec<String> = Vec::new();
+        for u in &uuids {
+            if db::user_name_by_uuid(&conn, u).is_some() {
+                fu.push(u.to_string());
+            }
+        }
+        let mut fn_: Vec<String> = Vec::new();
+        for n in &names {
+            if db::user_by_name(&conn, n).is_some() {
+                fn_.push(n.to_lowercase());
+            }
+        }
+        (fu, fn_)
+    };
+
+    send(
+        tx,
+        json!({
+            "op": "users.check.result",
+            "uuids": found_uuids,
+            "names": found_names,
         })
         .to_string(),
     )
