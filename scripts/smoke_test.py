@@ -388,13 +388,26 @@ async def run_dev_mode_suite(mock: MockMojangServer | None):
             await h3.send(json.dumps({"op": "join.begin", "host": a_uuid}))
             await recv_until(h3, "join.ready")
             h3_relay = await recv_until(a, "relay.host")
-            check("hop3 joins Open world with joinSource='open'", h3_relay.get("joinSource") == "open")
+            check("3-hop hop3 joins Friend Network world with joinSource='open'", h3_relay.get("joinSource") == "open")
+
+            # A completely disconnected stranger must NOT see or join a Friend Network world.
+            async with websockets.connect(WS) as outsider:
+                await outsider.send(json.dumps({"op": "hello", "mode": "dev", "name": "outsider",
+                                                "uuid": offline_uuid("outsider")}))
+                await recv_until(outsider, "welcome")
+                out_sync = await recv_until(outsider, "friends.sync")
+                check("disconnected outsider does not see Friend Network world",
+                      not any(d.get("host") == a_uuid for d in out_sync.get("discoverable", [])))
+                await outsider.send(json.dumps({"op": "join.begin", "host": a_uuid}))
+                out_err = await recv_until(outsider, "error")
+                check("disconnected outsider rejected from Friend Network world",
+                      "friend network" in out_err.get("message", ""))
 
             await a.send(json.dumps({"op": "session.update", "banned": [h3_uuid]}))
             await recv_until(h3, "session.state")
             await h3.send(json.dumps({"op": "join.begin", "host": a_uuid}))
             ban_err = await recv_until(h3, "error")
-            check("banned player rejected even on Open world", "banned" in ban_err.get("message", ""))
+            check("banned player rejected even on Friend Network world", "banned" in ban_err.get("message", ""))
 
             # Clean back to normal friends access before closing
             await a.send(json.dumps({"op": "session.update", "access": "friends", "banned": []}))

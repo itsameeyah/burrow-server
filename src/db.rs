@@ -1,6 +1,7 @@
 //! SQLite storage: users, friendship graph, pending requests, event log.
 
 use rusqlite::Connection;
+use std::collections::HashSet;
 use std::path::Path;
 use uuid::Uuid;
 
@@ -172,6 +173,48 @@ pub fn friends_of_friends(conn: &Connection, me: &Uuid) -> Vec<(Uuid, String)> {
     )
 }
 
+/// All users reachable from `me` through any chain of friendships (excluding `me`).
+/// Uses a recursive SQLite CTE with `UNION` deduplication so cycles terminate
+/// cleanly and disconnected strangers are never included.
+pub fn friend_network(conn: &Connection, me: &Uuid) -> HashSet<Uuid> {
+    let Ok(mut stmt) = conn.prepare(
+        "WITH RECURSIVE net(uuid) AS ( \
+             SELECT b FROM friendships WHERE a = ?1 \
+             UNION \
+             SELECT f.b FROM friendships f JOIN net n ON f.a = n.uuid \
+         ) \
+         SELECT uuid FROM net WHERE uuid != ?1",
+    ) else {
+        return HashSet::new();
+    };
+    let rows = stmt.query_map(rusqlite::params![me.to_string()], |r| r.get::<_, String>(0));
+    match rows {
+        Ok(iter) => iter
+            .filter_map(|r| r.ok())
+            .filter_map(|s| Uuid::parse_str(&s).ok())
+            .collect(),
+        Err(_) => HashSet::new(),
+    }
+}
+
+/// Returns true iff `b` is reachable from `a` along any chain of friendships.
+pub fn in_friend_network(conn: &Connection, a: &Uuid, b: &Uuid) -> bool {
+    if a == b {
+        return false;
+    }
+    conn.query_row(
+        "WITH RECURSIVE net(uuid) AS ( \
+             SELECT b FROM friendships WHERE a = ?1 \
+             UNION \
+             SELECT f.b FROM friendships f JOIN net n ON f.a = n.uuid \
+         ) \
+         SELECT 1 FROM net WHERE uuid = ?2 LIMIT 1",
+        rusqlite::params![a.to_string(), b.to_string()],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
 pub fn add_request(conn: &Connection, sender: &Uuid, receiver: &Uuid) -> bool {
     conn.execute(
         "INSERT OR IGNORE INTO requests(sender, receiver, created_at) VALUES(?1, ?2, ?3)",
@@ -340,5 +383,40 @@ mod tests {
         upsert_user(&mut conn, u1, "Alex").unwrap();
         assert_eq!(user_by_name(&conn, "Alex"), Some((u1, "Alex".into())));
         assert_eq!(user_by_name(&conn, "steve"), Some((u2, "steve".into())));
+    }
+
+    #[test]
+    fn friend_network_traverses_chains_and_excludes_strangers() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE friendships(
+                a TEXT NOT NULL,
+                b TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY(a, b));",
+        )
+        .unwrap();
+
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        let d = Uuid::new_v4();
+        let stranger = Uuid::new_v4();
+
+        add_friendship(&conn, &a, &b);
+        add_friendship(&conn, &b, &c);
+        add_friendship(&conn, &c, &d);
+        // Add a cycle back to b to verify termination.
+        add_friendship(&conn, &d, &b);
+
+        let net = friend_network(&conn, &a);
+        assert!(net.contains(&b));
+        assert!(net.contains(&c));
+        assert!(net.contains(&d));
+        assert!(!net.contains(&a));
+        assert!(!net.contains(&stranger));
+
+        assert!(in_friend_network(&conn, &a, &d));
+        assert!(!in_friend_network(&conn, &a, &stranger));
     }
 }

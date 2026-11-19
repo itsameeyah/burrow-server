@@ -52,10 +52,6 @@ impl Hub {
         self.inner.read().await.get(uuid).map(|c| c.name.clone())
     }
 
-    pub async fn online_uuids(&self) -> Vec<Uuid> {
-        self.inner.read().await.keys().copied().collect()
-    }
-
     pub async fn is_online(&self, uuid: &Uuid) -> bool {
         self.inner.read().await.contains_key(uuid)
     }

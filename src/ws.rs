@@ -538,7 +538,16 @@ async fn build_sync(app: &App, me: &Uuid) -> String {
         }));
     }
 
-    // Non-friend sessions this user can see & join (invited, FOF, or Open).
+    // Non-friend sessions this user can see & join (invited, FOF, or Friend Network).
+    let has_open_session = sessions
+        .iter()
+        .any(|(h, s)| h != me && !friend_set.contains(h) && s.access == AccessMode::Open);
+    let network_set: HashSet<Uuid> = if has_open_session {
+        let conn = app.db.lock().unwrap();
+        db::friend_network(&conn, me)
+    } else {
+        HashSet::new()
+    };
     let mut discoverable: Vec<Value> = Vec::new();
     for (host_uuid, sess) in &sessions {
         if host_uuid == me || friend_set.contains(host_uuid) || sess.banned.contains(me) {
@@ -551,9 +560,13 @@ async fn build_sync(app: &App, me: &Uuid) -> String {
                 .get(host_uuid)
                 .map(|via_name| ("friend_of_friend", via_name.clone()))
         } else if sess.access == AccessMode::Open {
-            let via_name = fof_map.get(host_uuid).cloned().unwrap_or_default();
-            let kind = if via_name.is_empty() { "open" } else { "friend_of_friend" };
-            Some((kind, via_name))
+            if let Some(via_name) = fof_map.get(host_uuid) {
+                Some(("friend_of_friend", via_name.clone()))
+            } else if network_set.contains(host_uuid) {
+                Some(("open", String::new()))
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -947,7 +960,7 @@ async fn join_begin(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
         return;
     }
 
-    let (direct_friend, mutual) = {
+    let (direct_friend, mutual, in_network) = {
         let conn = app.db.lock().unwrap();
         let direct = db::are_friends(&conn, me, &host);
         let mutual = if direct {
@@ -955,7 +968,12 @@ async fn join_begin(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
         } else {
             db::mutual_friend(&conn, &host, me)
         };
-        (direct, mutual)
+        let in_net = if direct || mutual.is_some() || sess.access != AccessMode::Open {
+            direct || mutual.is_some()
+        } else {
+            db::in_friend_network(&conn, &host, me)
+        };
+        (direct, mutual, in_net)
     };
 
     let invite_info = sess.active_invite(me).cloned();
@@ -989,8 +1007,11 @@ async fn join_begin(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
                     ("friend", String::new())
                 } else if let Some((_, mutual_name)) = mutual {
                     ("friend_of_friend", mutual_name)
-                } else {
+                } else if in_network {
                     ("open", String::new())
+                } else {
+                    send(tx, error_op("this world is limited to the host's friend network")).await;
+                    return;
                 }
             }
         }
@@ -1230,11 +1251,17 @@ async fn push_session_state(app: &Arc<App>, me: &Uuid, prev: Option<&HostedSessi
         || curr.as_ref().is_some_and(|s| s.access == AccessMode::FriendsOfFriends);
     let involves_open = prev.is_some_and(|s| s.access == AccessMode::Open)
         || curr.as_ref().is_some_and(|s| s.access == AccessMode::Open);
+    let network_set: HashSet<Uuid> = if involves_open {
+        let conn = app.db.lock().unwrap();
+        db::friend_network(&conn, me)
+    } else {
+        HashSet::new()
+    };
     if involves_fof {
         recipients.extend(fof_map.keys().copied());
     }
     if involves_open {
-        recipients.extend(app.hub.online_uuids().await);
+        recipients.extend(network_set.iter().copied());
     }
     if let Some(p) = prev {
         recipients.extend(p.invites.keys().copied());
@@ -1276,8 +1303,10 @@ async fn push_session_state(app: &Arc<App>, me: &Uuid, prev: Option<&HostedSessi
                         (true, "friend", String::new())
                     } else if let Some(via) = fof_map.get(&recipient) {
                         (true, "friend_of_friend", via.clone())
-                    } else {
+                    } else if network_set.contains(&recipient) {
                         (true, "open", String::new())
+                    } else {
+                        (false, "", String::new())
                     }
                 }
             },
