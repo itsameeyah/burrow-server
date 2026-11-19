@@ -19,15 +19,13 @@ services:
       BURROW_DISCORD_ALLOWED_USER_ID: "${BURROW_DISCORD_ALLOWED_USER_ID:-}"
       BURROW_SECURE_COOKIES: "${BURROW_SECURE_COOKIES:-1}"
 
-  # Optional Cloudflare Tunnel sidecar — uncomment & set CLOUDFLARED_TOKEN in .env
-  # if you choose the Cloudflare Tunnel option:
-  # cloudflared:
-  #   image: cloudflare/cloudflared:latest
-  #   container_name: burrow-cloudflared
-  #   restart: unless-stopped
-  #   command: tunnel --no-autoupdate run --token ${CLOUDFLARED_TOKEN}
-  #   depends_on:
-  #     - burrow
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: burrow-cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARED_TOKEN}
+    depends_on:
+      - burrow
 
 volumes:
   burrow-data:
