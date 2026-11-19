@@ -4,10 +4,10 @@ services:
     container_name: burrow
     restart: unless-stopped
     ports:
-      # Exposed on port 8787 (reachable on LAN & from a host reverse proxy).
-      # If using a cloudflared sidecar on the same compose network, you can
-      # switch this to "127.0.0.1:8787:8787" or remove ports entirely.
-      - "8787:8787"
+      # Exposed on port 8787 by default (override with BURROW_PORT in .env).
+      # If using Cloudflare Tunnel only, you can switch this to
+      # "127.0.0.1:8787:8787" or remove ports entirely.
+      - "${BURROW_PORT:-8787}:8787"
     volumes:
       - burrow-data:/data
     environment:
@@ -15,14 +15,17 @@ services:
       BURROW_ADMIN_TOKEN: "${BURROW_ADMIN_TOKEN:-}"
       BURROW_DISCORD_CLIENT_ID: "${BURROW_DISCORD_CLIENT_ID:-}"
       BURROW_DISCORD_CLIENT_SECRET: "${BURROW_DISCORD_CLIENT_SECRET:-}"
-      BURROW_DISCORD_REDIRECT_URI: "${BURROW_DISCORD_REDIRECT_URI:-https://burrow.meeyah.dev/admin/callback}"
+      BURROW_DISCORD_REDIRECT_URI: "${BURROW_DISCORD_REDIRECT_URI:-}"
       BURROW_DISCORD_ALLOWED_USER_ID: "${BURROW_DISCORD_ALLOWED_USER_ID:-}"
       BURROW_SECURE_COOKIES: "${BURROW_SECURE_COOKIES:-1}"
 
+  # Optional Cloudflare Tunnel sidecar.
+  # Start with: docker compose --profile tunnel up -d --build
   cloudflared:
     image: cloudflare/cloudflared:latest
     container_name: burrow-cloudflared
     restart: unless-stopped
+    profiles: ["tunnel"]
     command: tunnel --no-autoupdate run --token ${CLOUDFLARED_TOKEN}
     depends_on:
       - burrow
