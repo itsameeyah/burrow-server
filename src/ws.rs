@@ -66,6 +66,8 @@ impl InvitePerm {
     }
 }
 
+const INVITE_TTL_SECS: i64 = 30;
+
 #[derive(Clone, Debug)]
 pub struct HostedSession {
     pub world_name: String,
@@ -74,10 +76,22 @@ pub struct HostedSession {
     pub locked: bool,
     pub max_players: u32,
     pub player_count: u32,
-    /// invitee uuid -> (inviter uuid, inviter name)
-    pub invites: HashMap<Uuid, (Uuid, String)>,
+    /// invitee uuid -> (inviter uuid, inviter name, expires_at unix secs)
+    pub invites: HashMap<Uuid, (Uuid, String, i64)>,
     pub operators: HashSet<Uuid>,
     pub banned: HashSet<Uuid>,
+}
+
+impl HostedSession {
+    pub fn active_invite(&self, uuid: &Uuid) -> Option<&(Uuid, String, i64)> {
+        let now = db::now();
+        self.invites.get(uuid).filter(|(_, _, exp)| *exp > now)
+    }
+
+    pub fn prune_expired_invites(&mut self) {
+        let now = db::now();
+        self.invites.retain(|_, (_, _, exp)| *exp > now);
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -304,7 +318,7 @@ fn visible_to_friend(session: &HostedSession, viewer: &Uuid) -> bool {
     if session.banned.contains(viewer) {
         return false;
     }
-    session.access != AccessMode::InviteOnly || session.invites.contains_key(viewer)
+    session.access != AccessMode::InviteOnly || session.active_invite(viewer).is_some()
 }
 
 /// Build the friends.sync payload for one user: friends (with live
@@ -357,7 +371,7 @@ async fn build_sync(app: &App, me: &Uuid) -> String {
         if host_uuid == me || friend_set.contains(host_uuid) || sess.banned.contains(me) {
             continue;
         }
-        let via = if let Some((_, inviter_name)) = sess.invites.get(me) {
+        let via = if let Some((_, inviter_name, _)) = sess.active_invite(me) {
             Some(("invite", inviter_name.clone()))
         } else if sess.access == AccessMode::FriendsOfFriends {
             fof_map
@@ -691,7 +705,8 @@ async fn session_invite(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
             send(tx, error_op("that player is banned from this world")).await;
             return;
         }
-        sess.invites.insert(target_uuid, (*me, inviter_name.clone()));
+        sess.prune_expired_invites();
+        sess.invites.insert(target_uuid, (*me, inviter_name.clone(), db::now() + INVITE_TTL_SECS));
         sess.world_name.clone()
     };
 
@@ -710,6 +725,7 @@ async fn session_invite(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
                 "worldName": world_name,
                 "invitedBy": me.to_string(),
                 "invitedByName": inviter_name,
+                "ttlSeconds": INVITE_TTL_SECS,
             })
             .to_string(),
         )
@@ -761,8 +777,8 @@ async fn join_begin(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
         (direct, mutual)
     };
 
-    let invite_info = sess.invites.get(me).cloned();
-    let (join_source, via_name): (&str, String) = if let Some((_, inviter_name)) = invite_info {
+    let invite_info = sess.active_invite(me).cloned();
+    let (join_source, via_name): (&str, String) = if let Some((_, inviter_name, _)) = invite_info {
         ("invite", inviter_name)
     } else {
         match sess.access {
@@ -997,10 +1013,10 @@ async fn push_session_state(app: &Arc<App>, me: &Uuid, prev: Option<&HostedSessi
             None => (false, "", String::new()),
             Some(s) if is_self => (true, "host", String::new()),
             Some(s) if s.banned.contains(&recipient) => (false, "", String::new()),
-            Some(s) if s.invites.contains_key(&recipient) => (
+            Some(s) if s.active_invite(&recipient).is_some() => (
                 true,
                 "invite",
-                s.invites.get(&recipient).map(|(_, n)| n.clone()).unwrap_or_default(),
+                s.active_invite(&recipient).map(|(_, n, _)| n.clone()).unwrap_or_default(),
             ),
             Some(s) => match s.access {
                 AccessMode::InviteOnly => (false, "", String::new()),
