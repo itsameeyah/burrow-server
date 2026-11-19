@@ -49,7 +49,7 @@ h1 { color: var(--header-text); font-weight: 700; font-size: 26px; margin: 0 0 4
 .card h2 { font-size: 15px; color: var(--header-text); margin: 0 0 10px; font-weight: 500; }
 .foot { color: var(--text-muted); font-size: 12px; text-align: center; margin-top: 8px; }
 .uplot { font-family: 'Quicksand', Arial, sans-serif; }
-.ulegend { display: none !important; }
+.u-legend { display: none !important; }
 </style>
 {{UPLOT_CSS}}
 </head>
@@ -91,25 +91,36 @@ function refreshTiles() {
 refreshTiles();
 setInterval(refreshTiles, 5000);
 
+const plots = [];
 fetch('/api/metrics/history?days=30').then(r => r.json()).then(h => {
     function makeChart(container, data, color) {
         if (!data || !data[0] || data[0].length < 2) { container.textContent = 'not enough history yet 🙂'; return; }
-        new uPlot({
-            width: container.clientWidth - 8,
+        const plot = new uPlot({
+            width: Math.max(container.clientWidth - 8, 240),
             height: 200,
-            stroke: { 0: color },
-            fill: { 0: color + '22' },
+            legend: { show: false },
+            series: [
+                {},
+                { stroke: color, fill: color + '22', width: 2 }
+            ],
             axes: [
                 {},
-                { values: (u, vals) => vals.map(v => v.toFixed(0)) }
+                { values: (u, vals) => vals.map(v => Number.isInteger(v) ? String(v) : '') }
             ],
             scales: { x: { time: true } },
-            cursor: { drag: false }
+            cursor: { drag: { x: false, y: false } }
         }, data, container);
+        plots.push({ plot, container });
     }
     makeChart(document.getElementById('chart-events'), h.events, '#c2427f');
     makeChart(document.getElementById('chart-users'), h.usersTotal, '#9e3f77');
 }).catch(() => {});
+
+window.addEventListener('resize', () => {
+    for (const { plot, container } of plots) {
+        plot.setSize({ width: Math.max(container.clientWidth - 8, 240), height: 200 });
+    }
+});
 </script>
 </body>
 </html>

@@ -38,6 +38,7 @@ async fn main() {
         discord_allowed_user_id,
         oauth_states: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         dash_sessions: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        http: reqwest::Client::new(),
     });
 
     let router = axum::Router::new()

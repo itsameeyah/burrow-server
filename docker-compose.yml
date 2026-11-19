@@ -13,5 +13,12 @@ services:
       # Dev identities are accepted during the LAN testing phase.
       # Flip to "0" once real Microsoft auth lands.
       BURROW_DEV_MODE: "1"
-      # Set BURROW_ADMIN_TOKEN to publish the placeholder dashboard;
-      # the real Discord-OAuth dashboard arrives in milestone 3.
+      # Optional static bearer token for scripts / headless checks:
+      # BURROW_ADMIN_TOKEN: ""
+      # Discord OAuth gate for /admin (fill all four to enable):
+      # BURROW_DISCORD_CLIENT_ID: ""
+      # BURROW_DISCORD_CLIENT_SECRET: ""
+      # BURROW_DISCORD_REDIRECT_URI: "http://192.168.0.126:8787/admin/callback"
+      # BURROW_DISCORD_ALLOWED_USER_ID: ""
+      # Flip to "1" once served over HTTPS (Cloudflare Tunnel phase):
+      # BURROW_SECURE_COOKIES: "0"

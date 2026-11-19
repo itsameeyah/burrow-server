@@ -7,7 +7,10 @@ use uuid::Uuid;
 pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS users(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
+         PRAGMA busy_timeout = 5000;
+         CREATE TABLE IF NOT EXISTS users(
             uuid TEXT PRIMARY KEY,
             name TEXT NOT NULL UNIQUE COLLATE NOCASE,
             created_at INTEGER NOT NULL);
@@ -54,21 +57,6 @@ pub fn user_by_name(conn: &Connection, name: &str) -> Option<(Uuid, String)> {
         .query_row(
             "SELECT uuid, name FROM users WHERE name = ?1",
             rusqlite::params![name],
-            |r| {
-                let uuid_str: String = r.get(0)?;
-                let user_name: String = r.get(1)?;
-                Ok((uuid_str, user_name))
-            },
-        )
-        .ok();
-    row.and_then(|(s, n)| Uuid::parse_str(&s).ok().map(|u| (u, n)))
-}
-
-pub fn user_by_uuid(conn: &Connection, uuid: &Uuid) -> Option<(Uuid, String)> {
-    let row: Option<(String, String)> = conn
-        .query_row(
-            "SELECT uuid, name FROM users WHERE uuid = ?1",
-            rusqlite::params![uuid.to_string()],
             |r| {
                 let uuid_str: String = r.get(0)?;
                 let user_name: String = r.get(1)?;
@@ -152,6 +140,15 @@ pub fn delete_request(conn: &Connection, sender: &Uuid, receiver: &Uuid) {
         "DELETE FROM requests WHERE sender = ?1 AND receiver = ?2",
         rusqlite::params![sender.to_string(), receiver.to_string()],
     );
+}
+
+/// (uuid, name) pairs for all friends of `me` in a single indexed join.
+pub fn friends_with_names(conn: &Connection, me: &Uuid) -> Vec<(Uuid, String)> {
+    request_rows(
+        conn,
+        "SELECT f.b, u.name FROM friendships f JOIN users u ON u.uuid = f.b WHERE f.a = ?1",
+        me,
+    )
 }
 
 /// (sender, name) pairs for requests addressed to me.

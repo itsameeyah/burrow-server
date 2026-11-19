@@ -29,6 +29,8 @@ pub struct App {
     pub oauth_states: tokio::sync::Mutex<HashMap<String, i64>>,
     /// Signed-in dashboard sessions (cookie token -> expiry).
     pub dash_sessions: tokio::sync::Mutex<HashMap<String, i64>>,
+    /// Shared HTTP client for Discord OAuth calls.
+    pub http: reqwest::Client,
 }
 
 type Tx = mpsc::Sender<String>;
@@ -206,10 +208,7 @@ async fn hello(app: &Arc<App>, identity: &mut Option<Uuid>, tx: &Tx, conn_id: u6
 async fn build_sync(app: &App, me: &Uuid) -> String {
     let (friend_pairs, incoming, outgoing) = {
         let conn = app.db.lock().unwrap();
-        let friends: Vec<(Uuid, String)> = db::friend_uuids(&conn, me)
-            .iter()
-            .filter_map(|u| db::user_by_uuid(&conn, u))
-            .collect();
+        let friends = db::friends_with_names(&conn, me);
         let incoming = db::incoming_requests(&conn, me);
         let outgoing = db::outgoing_requests(&conn, me);
         (friends, incoming, outgoing)

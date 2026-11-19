@@ -11,8 +11,9 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use std::collections::HashMap;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -26,11 +27,17 @@ pub struct Room {
 #[derive(Default)]
 pub struct Relay {
     pub rooms: std::sync::Mutex<HashMap<Uuid, Room>>,
+    active_tunnels: AtomicUsize,
 }
 
 impl Relay {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Pending (awaiting pairing) plus currently spliced relay tunnels.
+    pub fn active_count(&self) -> usize {
+        self.rooms.lock().unwrap().len() + self.active_tunnels.load(Ordering::Relaxed)
     }
 
     /// Create a room and spawn its broker. The broker waits (bounded) for
@@ -55,36 +62,58 @@ impl Relay {
     }
 }
 
+struct ActiveTunnelGuard(Arc<App>);
+
+impl ActiveTunnelGuard {
+    fn enter(app: Arc<App>) -> Self {
+        app.relay.active_tunnels.fetch_add(1, Ordering::Relaxed);
+        Self(app)
+    }
+}
+
+impl Drop for ActiveTunnelGuard {
+    fn drop(&mut self) {
+        self.0.relay.active_tunnels.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 async fn broker(
     app: Arc<App>,
     room_id: Uuid,
     host_rx: oneshot::Receiver<WebSocket>,
     joiner_rx: oneshot::Receiver<WebSocket>,
 ) {
-    let paired = tokio::time::timeout(Duration::from_secs(60), async {
-        let Ok(host) = host_rx.await else {
-            return None;
-        };
-        let Ok(joiner) = joiner_rx.await else {
-            return None;
-        };
-        Some((host, joiner))
-    })
+    let paired = tokio::time::timeout(
+        Duration::from_secs(60),
+        async { tokio::try_join!(host_rx, joiner_rx).ok() },
+    )
     .await
     .unwrap_or(None);
 
     app.relay.rooms.lock().unwrap().remove(&room_id);
-    {
-        let conn = app.db.lock().unwrap();
-        db::log_event(&conn, "relay_close", None);
-    }
 
     match paired {
         Some((host, joiner)) => {
+            let _guard = ActiveTunnelGuard::enter(app.clone());
+            {
+                let conn = app.db.lock().unwrap();
+                db::log_event(&conn, "relay_open", None);
+            }
             tracing::info!("relay room {room_id} paired, splicing");
             splice(host, joiner).await;
+            {
+                let conn = app.db.lock().unwrap();
+                db::log_event(&conn, "relay_close", None);
+            }
+            tracing::info!("relay room {room_id} closed");
         }
-        None => tracing::info!("relay room {room_id} expired unmatched"),
+        None => {
+            {
+                let conn = app.db.lock().unwrap();
+                db::log_event(&conn, "relay_expired", None);
+            }
+            tracing::info!("relay room {room_id} expired unmatched");
+        }
     }
 }
 

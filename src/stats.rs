@@ -20,7 +20,7 @@ pub async fn snapshot(app: &Arc<App>) -> Value {
     }
     let online_now = app.hub.len().await;
     let active_sessions = app.sessions.lock().await.len();
-    let relay_rooms = app.relay.rooms.lock().unwrap().len();
+    let relay_rooms = app.relay.active_count();
 
     json!({
         "users_total": users_total,
@@ -36,7 +36,8 @@ pub async fn snapshot(app: &Arc<App>) -> Value {
 /// Per-day series for the dashboard graphs. Counts only, never names.
 /// Shape: { "events": [[dayTs...],[count...]], "usersNew": [[...],[...]], "usersTotal": [[...],[...] }
 pub async fn history(app: &Arc<App>, days: i64) -> Value {
-    let since = db::now() - days.max(1) * 86_400;
+    let today = (db::now() / 86_400) * 86_400;
+    let since = today - (days.max(1) - 1) * 86_400;
 
     let events;
     let users_new;
@@ -53,22 +54,44 @@ pub async fn history(app: &Arc<App>, days: i64) -> Value {
         users_total - users_new.iter().map(|(_, c)| *c).sum::<i64>();
 
     // Merge per-kind rows into one total-per-day series.
-    let mut event_days: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
+    let mut raw_events: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
     for (day, _kind, count) in &events {
-        *event_days.entry(*day).or_insert(0) += *count;
+        *raw_events.entry(*day).or_insert(0) += *count;
     }
-    let mut user_days: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
+    let mut raw_users: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
     for (day, count) in &users_new {
-        user_days.entry(*day).or_insert(0);
-        *user_days.get_mut(day).unwrap() += *count;
+        *raw_users.entry(*day).or_insert(0) += *count;
     }
 
-    // Cumulative users: start from everyone registered before the window.
-    let mut running = users_before;
+    // Fill quiet days between the earliest recorded day in the window and
+    // today so graphs show continuous timelines (with 0s on quiet days and a
+    // flat cumulative line even when all users signed up on one day).
+    let mut event_days: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
+    if let Some(&first_day) = raw_events.keys().next() {
+        let mut d = first_day;
+        while d <= today {
+            event_days.insert(d, *raw_events.get(&d).unwrap_or(&0));
+            d += 86_400;
+        }
+    }
+
+    let mut user_days: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
     let mut total_days: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
-    for (day, count) in &user_days {
-        running += *count;
-        total_days.insert(*day, running);
+    let first_user_day = raw_users
+        .keys()
+        .next()
+        .copied()
+        .or_else(|| (users_total > 0).then_some(since));
+    if let Some(first_day) = first_user_day {
+        let mut running = users_before;
+        let mut d = first_day;
+        while d <= today {
+            let added = *raw_users.get(&d).unwrap_or(&0);
+            user_days.insert(d, added);
+            running += added;
+            total_days.insert(d, running);
+            d += 86_400;
+        }
     }
 
     let events_value = series(&event_days);

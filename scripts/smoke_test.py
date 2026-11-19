@@ -165,7 +165,18 @@ async def main():
             check("metrics hidden without token (404)", e.code == 404)
 
         await a.send(json.dumps({"op": "session.close"}))
+        sess_closed = await recv_until(b, "session.state")
+        sc0 = sess_closed["sessions"][0]
+        check("B sees A stopped hosting",
+              sc0.get("host") == a_uuid and sc0.get("active") is False)
         print("---- session closed, winding down ----")
+
+        # --- disconnect pushes offline presence to friend ---
+        await a.close()
+        pres = await recv_until(b, "presence.batch")
+        check("B sees A go offline on disconnect",
+              any(u.get("uuid") == a_uuid and u.get("presence") == "offline"
+                  for u in pres.get("updates", [])))
 
     fails = [n for n, ok in RESULTS if not ok]
     print(f"\n{len(RESULTS) - len(fails)}/{len(RESULTS)} checks passed")

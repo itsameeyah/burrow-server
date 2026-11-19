@@ -122,9 +122,12 @@ pub async fn admin_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Resp
     let state = uuid::Uuid::new_v4().to_string();
     {
         let mut states = app.oauth_states.lock().await;
-        if states.len() > 64 {
-            let cutoff = now() + STATE_TTL;
+        if states.len() >= 64 {
+            let cutoff = now();
             states.retain(|_, exp| *exp > cutoff);
+        }
+        if states.len() >= 256 {
+            return StatusCode::TOO_MANY_REQUESTS.into_response();
         }
         states.insert(state.clone(), now() + STATE_TTL);
     }
@@ -138,8 +141,19 @@ pub async fn admin_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Resp
 }
 
 fn urlencoding_redirect(uri: &str) -> String {
-    // Minimal percent-encoding for the redirect_uri query parameter.
-    uri.replace(':', "%3A").replace('/', "%2F")
+    let mut out = String::with_capacity(uri.len());
+    for b in uri.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(out, "%{:02X}", b);
+            }
+        }
+    }
+    out
 }
 
 /// GET /admin/callback?code=..&state=.. — finish the OAuth round-trip.
@@ -178,8 +192,8 @@ pub async fn oauth_callback(
         ("code", code.as_str()),
         ("redirect_uri", redirect_uri.as_str()),
     ];
-    let http = reqwest::Client::new();
-    let token_res = http
+    let token_res = app
+        .http
         .post("https://discord.com/api/oauth2/token")
         .form(&params_ex)
         .send()
@@ -199,9 +213,13 @@ pub async fn oauth_callback(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    if access_token.is_empty() {
+        return Html("<h3>Discord did not return an access token</h3>").into_response();
+    }
 
     // Who is signing in?
-    let me_res = http
+    let me_res = app
+        .http
         .get("https://discord.com/api/users/@me")
         .bearer_auth(&access_token)
         .send()
@@ -209,6 +227,10 @@ pub async fn oauth_callback(
     let Ok(me_res) = me_res else {
         return Html("<h3>could not read your Discord profile</h3>").into_response();
     };
+    if !me_res.status().is_success() {
+        tracing::warn!("discord @me request failed: {}", me_res.status());
+        return Html("<h3>Discord rejected the profile lookup</h3>").into_response();
+    }
     let Ok(me) = me_res.json::<Value>().await else {
         return Html("<h3>unexpected profile response</h3>").into_response();
     };
@@ -219,7 +241,7 @@ pub async fn oauth_callback(
         .to_string();
 
     // THE allowlist: exactly one account may ever pass this gate.
-    if user_id != app.discord_allowed_user_id.clone().unwrap_or_default() {
+    if user_id.is_empty() || user_id != app.discord_allowed_user_id.clone().unwrap_or_default() {
         tracing::warn!("dashboard login attempt by discord id {}", user_id);
         return Html("<h3>this dashboard isn't for you 🐇</h3>")
             .into_response();
