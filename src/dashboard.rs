@@ -6,7 +6,7 @@
 //! redirect or a setup page and /api/* are 404 — the dashboard simply does
 //! not exist to anyone else.
 
-use crate::{stats, ws::App};
+use crate::{db, stats, ws::App};
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Json, Redirect, Response};
@@ -16,11 +16,12 @@ use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DASHBOARD_TEMPLATE: &str = include_str!("assets/dashboard.html");
+const LOGIN_HTML: &str = include_str!("assets/login.html");
 const SETUP_HTML: &str = include_str!("assets/setup.html");
 const UPLOT_JS: &str = include_str!("assets/uplot.min.js");
 const UPLOT_CSS: &str = include_str!("assets/uplot.min.css");
 
-const SESSION_TTL: i64 = 86_400; // dashboard sessions last a day
+const SESSION_TTL: i64 = 30 * 86_400; // persistent dashboard sessions last 30 days
 const STATE_TTL: i64 = 600; // oauth round-trip window: 10 minutes
 
 fn now() -> i64 {
@@ -84,20 +85,8 @@ async fn dash_authed(app: &App, headers: &HeaderMap) -> bool {
     let Some(token) = cookie_value(headers, "burrow_session") else {
         return false;
     };
-    let mut sessions = app.dash_sessions.lock().await;
-    // Cheap opportunistic sweep so abandoned sessions can't accumulate.
-    if sessions.len() > 64 {
-        let cutoff = now();
-        sessions.retain(|_, exp| *exp > cutoff);
-    }
-    match sessions.get(&token) {
-        Some(expiry) if *expiry > now() => true,
-        Some(_) => {
-            sessions.remove(&token);
-            false
-        }
-        None => false,
-    }
+    let conn = app.db.lock().unwrap();
+    db::is_admin_session_valid(&conn, &token)
 }
 
 fn not_found() -> Response {
@@ -123,10 +112,11 @@ fn error_page(status: StatusCode, message: &str) -> Response {
     (status, Html(body)).into_response()
 }
 
-/// GET /admin/logout — revoke the session cookie and head back to meeyah.dev.
+/// GET /admin/logout — revoke the persisted session cookie and return to the login screen.
 pub async fn logout(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     if let Some(token) = cookie_value(&headers, "burrow_session") {
-        app.dash_sessions.lock().await.remove(&token);
+        let conn = app.db.lock().unwrap();
+        db::delete_admin_session(&conn, &token);
     }
     let secure = std::env::var("BURROW_SECURE_COOKIES")
         .map(|v| matches!(v.trim(), "1" | "true"))
@@ -142,26 +132,34 @@ pub async fn logout(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
     );
     let _ = headers_out.insert(
         header::LOCATION,
-        axum::http::HeaderValue::from_static("https://meeyah.dev"),
+        axum::http::HeaderValue::from_static("/admin"),
     );
     (StatusCode::FOUND, headers_out).into_response()
 }
 
-/// GET /admin — the gate itself.
+/// GET /admin — dashboard when signed in, otherwise a clean login screen.
 pub async fn admin_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     if dash_authed(&app, &headers).await {
         return Html(rendered_dashboard()).into_response();
     }
     if !discord_configured(&app) {
-        // Setup instructions are fine on a bare LAN dev server, but if an
-        // admin token policy exists, strangers get nothing at all.
         if app.admin_token.is_some() && !bearer_ok(&app, &headers) {
             return not_found();
         }
         return Html(SETUP_HTML).into_response();
     }
+    Html(LOGIN_HTML).into_response()
+}
 
-    // Start the OAuth round-trip: random state, remember it briefly.
+/// GET /admin/login — begin the Discord OAuth2 sign-in round-trip.
+pub async fn oauth_login(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    if dash_authed(&app, &headers).await {
+        return Redirect::to("/admin").into_response();
+    }
+    if !discord_configured(&app) {
+        return not_found();
+    }
+
     let state = uuid::Uuid::new_v4().to_string();
     {
         let mut states = app.oauth_states.lock().await;
@@ -289,13 +287,12 @@ pub async fn oauth_callback(
         return error_page(StatusCode::FORBIDDEN, "this account is not authorized");
     }
 
-    // Issue a session cookie. SameSite always; Secure when the operator
-    // tells us we're behind TLS (the tunnel phase sets this).
+    // Issue a persistent 30-day session stored in SQLite so restarts don't log Mia out.
     let token = uuid::Uuid::new_v4().to_string();
-    app.dash_sessions
-        .lock()
-        .await
-        .insert(token.clone(), now() + SESSION_TTL);
+    {
+        let conn = app.db.lock().unwrap();
+        db::create_admin_session(&conn, &token, now() + SESSION_TTL);
+    }
     let secure = std::env::var("BURROW_SECURE_COOKIES")
         .map(|v| matches!(v.trim(), "1" | "true"))
         .unwrap_or(false);

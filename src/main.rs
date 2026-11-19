@@ -44,7 +44,6 @@ async fn main() {
         discord_redirect_uri,
         discord_allowed_user_id,
         oauth_states: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-        dash_sessions: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         http: reqwest::Client::new(),
     });
 
@@ -52,6 +51,7 @@ async fn main() {
         .route("/ws", axum::routing::get(ws::ws_handler))
         .route("/relay/ws", axum::routing::get(relay::relay_handler))
         .route("/admin", axum::routing::get(dashboard::admin_page))
+        .route("/admin/login", axum::routing::get(dashboard::oauth_login))
         .route("/admin/callback", axum::routing::get(dashboard::oauth_callback))
         .route("/admin/logout", axum::routing::get(dashboard::logout))
         .route("/api/metrics", axum::routing::get(dashboard::metrics))

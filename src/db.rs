@@ -30,6 +30,9 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
             kind TEXT NOT NULL,
             ts INTEGER NOT NULL,
             data TEXT);
+        CREATE TABLE IF NOT EXISTS admin_sessions(
+            token TEXT PRIMARY KEY,
+            expires_at INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_requests_receiver ON requests(receiver);
         CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
         ",
@@ -281,6 +284,46 @@ pub fn log_event(conn: &Connection, kind: &str, data: Option<&str>) {
     let _ = conn.execute(
         "INSERT INTO events(kind, ts, data) VALUES(?1, ?2, ?3)",
         rusqlite::params![kind, now(), data],
+    );
+}
+
+pub fn create_admin_session(conn: &Connection, token: &str, expires_at: i64) {
+    let _ = conn.execute(
+        "DELETE FROM admin_sessions WHERE expires_at <= ?1",
+        rusqlite::params![now()],
+    );
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO admin_sessions(token, expires_at) VALUES(?1, ?2)",
+        rusqlite::params![token, expires_at],
+    );
+}
+
+pub fn is_admin_session_valid(conn: &Connection, token: &str) -> bool {
+    let cutoff = now();
+    let exp: Option<i64> = conn
+        .query_row(
+            "SELECT expires_at FROM admin_sessions WHERE token = ?1",
+            rusqlite::params![token],
+            |r| r.get::<_, i64>(0),
+        )
+        .ok();
+    match exp {
+        Some(e) if e > cutoff => true,
+        Some(_) => {
+            let _ = conn.execute(
+                "DELETE FROM admin_sessions WHERE token = ?1",
+                rusqlite::params![token],
+            );
+            false
+        }
+        None => false,
+    }
+}
+
+pub fn delete_admin_session(conn: &Connection, token: &str) {
+    let _ = conn.execute(
+        "DELETE FROM admin_sessions WHERE token = ?1",
+        rusqlite::params![token],
     );
 }
 

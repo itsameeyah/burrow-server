@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>burrow</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Quicksand:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+    --bg: #fff0f7;
+    --text: #9e3f77;
+    --header-bg: #ffffff;
+    --header-text: #c2427f;
+    --drawer-bg: #ffd6e7;
+    --text-muted: #a34f81;
+    --radius: 12px;
+    --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+    --surface: rgba(255, 255, 255, 0.84);
+    --surface-border: rgba(255, 255, 255, 0.72);
+    --shadow: 0 12px 32px rgba(158, 63, 119, 0.10);
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+    margin: 0;
+    padding: 0;
+    min-height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Quicksand', Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+}
+
+.bg-canvas {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 0;
+    pointer-events: none;
+}
+
+.stage {
+    position: relative;
+    z-index: 1;
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+}
+
+.login-card {
+    width: 100%;
+    max-width: 360px;
+    background: var(--surface);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid var(--surface-border);
+    border-radius: var(--radius);
+    padding: 28px 26px 24px;
+    box-shadow: var(--shadow);
+    text-align: center;
+}
+
+h1 {
+    margin: 0;
+    color: var(--header-text);
+    font-size: 28px;
+    font-weight: 700;
+    line-height: 1;
+    letter-spacing: -0.01em;
+}
+
+.sub {
+    margin: 8px 0 22px;
+    color: var(--text-muted);
+    font-size: 14px;
+    font-weight: 500;
+}
+
+.discord-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    width: 100%;
+    padding: 12px 18px;
+    border-radius: var(--radius);
+    background: var(--drawer-bg);
+    color: var(--header-text);
+    font-family: inherit;
+    font-size: 14px;
+    font-weight: 700;
+    text-decoration: none;
+    transition: transform 0.25s var(--ease-out), background 0.25s var(--ease-out), box-shadow 0.25s var(--ease-out);
+}
+
+.discord-btn:hover {
+    transform: scale(1.03);
+    box-shadow: 0 8px 20px rgba(158, 63, 119, 0.14);
+}
+
+.discord-btn:active {
+    transform: scale(0.99);
+}
+
+.discord-btn svg {
+    width: 18px;
+    height: 18px;
+    fill: currentColor;
+    flex-shrink: 0;
+}
+
+.note {
+    margin: 16px 0 0;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-muted);
+}
+
+.note a {
+    color: var(--text-muted);
+    text-decoration: none;
+}
+
+.note a:hover {
+    color: var(--header-text);
+}
+</style>
+</head>
+<body>
+<canvas class="bg-canvas" id="bg-canvas" aria-hidden="true"></canvas>
+
+<main class="stage">
+    <div class="login-card">
+        <h1>burrow</h1>
+        <p class="sub">admin dashboard</p>
+        <a class="discord-btn" href="/admin/login">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028c.462-.63.874-1.295 1.226-1.994.021-.041.001-.09-.041-.106a13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.028zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/>
+            </svg>
+            <span>sign in with discord</span>
+        </a>
+        <p class="note">stays signed in for 30 days · <a href="https://meeyah.dev">meeyah.dev</a></p>
+    </div>
+</main>
+
+<script>
+(function initBackground() {
+    const canvas = document.getElementById('bg-canvas');
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const styles = getComputedStyle(document.documentElement);
+    const circleColor = styles.getPropertyValue('--drawer-bg').trim() || '#ffd6e7';
+    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    function mulberry32(seed) {
+        return function() {
+            let t = seed += 0x6D2B79F5;
+            t = Math.imul(t ^ (t >>> 15), t | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        };
+    }
+
+    const rand = mulberry32(0xB04407);
+    const circles = Array.from({ length: 7 }, () => ({
+        bx: rand(),
+        by: rand(),
+        r: 0.14 + rand() * 0.22,
+        ax: 0.04 + rand() * 0.06,
+        ay: 0.04 + rand() * 0.06,
+        px: rand() * Math.PI * 2,
+        py: rand() * Math.PI * 2,
+        wx: (Math.PI * 2) / (65 + rand() * 110),
+        wy: (Math.PI * 2) / (75 + rand() * 115),
+    }));
+
+    function resize() {
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        canvas.width = Math.floor(window.innerWidth * dpr);
+        canvas.height = Math.floor(window.innerHeight * dpr);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+
+    function draw(ts) {
+        const t = ts / 1000;
+        const w = window.innerWidth;
+        const h = window.innerHeight;
+        const base = Math.min(w, h);
+        ctx.clearRect(0, 0, w, h);
+        ctx.fillStyle = circleColor;
+        ctx.globalAlpha = 0.25;
+        for (const c of circles) {
+            const x = (c.bx + Math.sin(t * c.wx + c.px) * c.ax) * w;
+            const y = (c.by + Math.cos(t * c.wy + c.py) * c.ay) * h;
+            ctx.beginPath();
+            ctx.arc(x, y, c.r * base, 0, Math.PI * 2);
+            ctx.fill();
+        }
+        ctx.globalAlpha = 1;
+        if (!reduceMotion) requestAnimationFrame(draw);
+    }
+
+    resize();
+    window.addEventListener('resize', () => {
+        resize();
+        if (reduceMotion) draw(0);
+    });
+    draw(0);
+})();
+</script>
+</body>
+</html>

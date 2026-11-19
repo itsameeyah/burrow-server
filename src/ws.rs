@@ -127,8 +127,6 @@ pub struct App {
     pub discord_allowed_user_id: Option<String>,
     /// Short-lived CSRF states for OAuth round-trips.
     pub oauth_states: tokio::sync::Mutex<HashMap<String, i64>>,
-    /// Signed-in dashboard sessions (cookie token -> expiry).
-    pub dash_sessions: tokio::sync::Mutex<HashMap<String, i64>>,
     /// Shared HTTP client for Discord OAuth calls.
     pub http: reqwest::Client,
 }

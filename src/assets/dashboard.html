@@ -18,6 +18,8 @@
     --text-muted: #a34f81;
     --radius: 12px;
     --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+    --surface: rgba(255, 255, 255, 0.84);
+    --surface-border: rgba(255, 255, 255, 0.72);
     --shadow: 0 8px 24px rgba(158, 63, 119, 0.08);
     --shadow-hover: 0 12px 28px rgba(158, 63, 119, 0.13);
     --hairline: rgba(158, 63, 119, 0.12);
@@ -103,8 +105,10 @@ html, body {
 
 .pill-btn {
     appearance: none;
-    border: 0;
-    background: var(--header-bg);
+    border: 1px solid var(--surface-border);
+    background: var(--surface);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
     color: var(--text);
     font-family: inherit;
     font-size: 13px;
@@ -136,7 +140,10 @@ html, body {
 }
 
 .tile {
-    background: var(--header-bg);
+    background: var(--surface);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid var(--surface-border);
     border-radius: var(--radius);
     padding: 18px 20px;
     box-shadow: var(--shadow);
@@ -200,7 +207,10 @@ html, body {
 
 .range-group {
     display: inline-flex;
-    background: var(--header-bg);
+    background: var(--surface);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid var(--surface-border);
     padding: 4px;
     border-radius: var(--radius);
     box-shadow: var(--shadow);
@@ -238,7 +248,10 @@ html, body {
 }
 
 .card {
-    background: var(--header-bg);
+    background: var(--surface);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid var(--surface-border);
     border-radius: var(--radius);
     padding: 20px 22px 16px;
     box-shadow: var(--shadow);

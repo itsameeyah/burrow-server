@@ -268,7 +268,6 @@ mod tests {
             discord_redirect_uri: None,
             discord_allowed_user_id: None,
             oauth_states: tokio::sync::Mutex::new(HashMap::new()),
-            dash_sessions: tokio::sync::Mutex::new(HashMap::new()),
             http: reqwest::Client::new(),
         });
 
