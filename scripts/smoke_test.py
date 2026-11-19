@@ -36,13 +36,13 @@ def offline_uuid(name: str) -> str:
     return str(uuid.UUID(bytes=bytes(digest)))
 
 
-async def recv_until(ws, op, timeout=5.0):
+async def recv_until(ws, op, pred=None, timeout=5.0):
     while True:
         try:
             msg = json.loads(await asyncio.wait_for(ws.recv(), timeout))
         except asyncio.TimeoutError:
             raise AssertionError(f"timed out waiting for op '{op}'")
-        if msg.get("op") == op:
+        if msg.get("op") == op and (pred is None or pred(msg)):
             return msg
 
 
@@ -105,6 +105,8 @@ async def main():
         relay_host = await recv_until(a, "relay.host")
         check("A got relay.host with its own token", bool(relay_host.get("token")))
         check("relay tokens differ per side", relay_host.get("token") != ready.get("token"))
+        check("relay.host carries joinSource='friend' and joinerName",
+              relay_host.get("joinSource") == "friend" and relay_host.get("joinerName") == "testbunny")
 
         # --- both connect to the relay and exchange raw bytes ---
         async with websockets.connect(
@@ -143,6 +145,81 @@ async def main():
             dup_hello = await recv_until(stray, "error")
             check("duplicate hello rejected", "already identified" in dup_hello.get("message", ""))
 
+        # --- access modes: locked, invite_only + invite, friends_of_friends (strict 2-hop), open, banned ---
+        b_uuid = welcome_b["uuid"]
+        await a.send(json.dumps({"op": "session.update", "locked": True}))
+        await recv_until(b, "session.state")
+        await b.send(json.dumps({"op": "join.begin", "host": a_uuid}))
+        locked_err = await recv_until(b, "error")
+        check("locked world blocks joins", "locked" in locked_err.get("message", ""))
+
+        await a.send(json.dumps({"op": "session.update", "locked": False, "access": "invite_only"}))
+        await recv_until(b, "session.state")
+        await b.send(json.dumps({"op": "join.begin", "host": a_uuid}))
+        inv_err = await recv_until(b, "error")
+        check("invite_only blocks uninvited friend", "invite-only" in inv_err.get("message", ""))
+
+        await a.send(json.dumps({"op": "session.invite", "uuid": b_uuid}))
+        inv_msg = await recv_until(b, "invite.received")
+        check("B received world invite from A", inv_msg.get("host") == a_uuid)
+        await b.send(json.dumps({"op": "join.begin", "host": a_uuid}))
+        await recv_until(b, "join.ready")
+        inv_relay = await recv_until(a, "relay.host")
+        check("invited join reports joinSource='invite'", inv_relay.get("joinSource") == "invite")
+
+        # FOF chain: A <-> B <-> hop2 <-> hop3 (hop2 is 2-hop, hop3 is 3-hop)
+        async with websockets.connect(WS) as h2, websockets.connect(WS) as h3:
+            await h2.send(json.dumps({"op": "hello", "mode": "dev", "name": "hop2",
+                                      "uuid": offline_uuid("hop2")}))
+            h2_uuid = (await recv_until(h2, "welcome"))["uuid"]
+            await recv_until(h2, "friends.sync")
+            await h3.send(json.dumps({"op": "hello", "mode": "dev", "name": "hop3",
+                                      "uuid": offline_uuid("hop3")}))
+            h3_uuid = (await recv_until(h3, "welcome"))["uuid"]
+            await recv_until(h3, "friends.sync")
+
+            # Make B <-> hop2 and hop2 <-> hop3 friends
+            await b.send(json.dumps({"op": "friend.add", "name": "hop2"}))
+            await recv_until(h2, "friends.sync")
+            await h2.send(json.dumps({"op": "friend.accept", "uuid": b_uuid}))
+            await recv_until(h2, "friends.sync")
+            await h2.send(json.dumps({"op": "friend.add", "name": "hop3"}))
+            await recv_until(h3, "friends.sync")
+            await h3.send(json.dumps({"op": "friend.accept", "uuid": h2_uuid}))
+            await recv_until(h3, "friends.sync")
+
+            await a.send(json.dumps({"op": "session.update", "access": "friends_of_friends"}))
+            h2_sess = await recv_until(h2, "session.state")
+            check("hop2 sees A's FOF world via testbunny",
+                  h2_sess["sessions"][0].get("active") is True and h2_sess["sessions"][0].get("viaName") == "testbunny")
+
+            await h2.send(json.dumps({"op": "join.begin", "host": a_uuid}))
+            await recv_until(h2, "join.ready")
+            h2_relay = await recv_until(a, "relay.host")
+            check("hop2 joins FOF world with viaName='testbunny'",
+                  h2_relay.get("joinSource") == "friend_of_friend" and h2_relay.get("viaName") == "testbunny")
+
+            await h3.send(json.dumps({"op": "join.begin", "host": a_uuid}))
+            h3_err = await recv_until(h3, "error")
+            check("3-hop hop3 rejected from friends_of_friends", "friends of friends" in h3_err.get("message", ""))
+
+            await a.send(json.dumps({"op": "session.update", "access": "open"}))
+            await recv_until(h3, "session.state")
+            await h3.send(json.dumps({"op": "join.begin", "host": a_uuid}))
+            await recv_until(h3, "join.ready")
+            h3_relay = await recv_until(a, "relay.host")
+            check("hop3 joins Open world with joinSource='open'", h3_relay.get("joinSource") == "open")
+
+            await a.send(json.dumps({"op": "session.update", "banned": [h3_uuid]}))
+            await recv_until(h3, "session.state")
+            await h3.send(json.dumps({"op": "join.begin", "host": a_uuid}))
+            ban_err = await recv_until(h3, "error")
+            check("banned player rejected even on Open world", "banned" in ban_err.get("message", ""))
+
+            # Clean back to normal friends access before closing
+            await a.send(json.dumps({"op": "session.update", "access": "friends", "banned": []}))
+            await recv_until(b, "session.state")
+
         # --- wrong token is rejected ---
         try:
             bad = await websockets.connect(f"{RELAY}?room={ready['roomId']}&token=not-a-token")
@@ -165,7 +242,10 @@ async def main():
             check("metrics hidden without token (404)", e.code == 404)
 
         await a.send(json.dumps({"op": "session.close"}))
-        sess_closed = await recv_until(b, "session.state")
+        sess_closed = await recv_until(
+            b, "session.state",
+            pred=lambda m: m["sessions"][0].get("host") == a_uuid and m["sessions"][0].get("active") is False,
+        )
         sc0 = sess_closed["sessions"][0]
         check("B sees A stopped hosting",
               sc0.get("host") == a_uuid and sc0.get("active") is False)
@@ -173,7 +253,11 @@ async def main():
 
         # --- disconnect pushes offline presence to friend ---
         await a.close()
-        pres = await recv_until(b, "presence.batch")
+        pres = await recv_until(
+            b, "presence.batch",
+            pred=lambda m: any(u.get("uuid") == a_uuid and u.get("presence") == "offline"
+                               for u in m.get("updates", [])),
+        )
         check("B sees A go offline on disconnect",
               any(u.get("uuid") == a_uuid and u.get("presence") == "offline"
                   for u in pres.get("updates", [])))

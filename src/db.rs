@@ -117,6 +117,53 @@ pub fn are_friends(conn: &Connection, a: &Uuid, b: &Uuid) -> bool {
     .is_ok()
 }
 
+/// Look up a user's stored display name by UUID.
+pub fn user_name_by_uuid(conn: &Connection, uuid: &Uuid) -> Option<String> {
+    conn.query_row(
+        "SELECT name FROM users WHERE uuid = ?1",
+        rusqlite::params![uuid.to_string()],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+}
+
+/// Strictly 1-hop mutual friend between `a` and `b` (i.e. `a` is friends with M
+/// and M is friends with `b`). Returns `(M.uuid, M.name)` if one exists.
+pub fn mutual_friend(conn: &Connection, a: &Uuid, b: &Uuid) -> Option<(Uuid, String)> {
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT f1.b, u.name \
+             FROM friendships f1 \
+             JOIN friendships f2 ON f1.b = f2.a \
+             JOIN users u ON u.uuid = f1.b \
+             WHERE f1.a = ?1 AND f2.b = ?2 \
+             LIMIT 1",
+            rusqlite::params![a.to_string(), b.to_string()],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .ok();
+    row.and_then(|(s, name)| Uuid::parse_str(&s).ok().map(|u| (u, name)))
+}
+
+/// Strictly 2-hop friends-of-friends of `me` (excluding `me` and direct friends).
+/// Returns `(fof_uuid, via_mutual_friend_name)`.
+pub fn friends_of_friends(conn: &Connection, me: &Uuid) -> Vec<(Uuid, String)> {
+    request_rows(
+        conn,
+        "SELECT f2.b, u.name \
+         FROM friendships f1 \
+         JOIN friendships f2 ON f1.b = f2.a \
+         JOIN users u ON u.uuid = f1.b \
+         WHERE f1.a = ?1 \
+           AND f2.b != ?1 \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM friendships direct WHERE direct.a = ?1 AND direct.b = f2.b \
+           ) \
+         GROUP BY f2.b",
+        me,
+    )
+}
+
 pub fn add_request(conn: &Connection, sender: &Uuid, receiver: &Uuid) -> bool {
     conn.execute(
         "INSERT OR IGNORE INTO requests(sender, receiver, created_at) VALUES(?1, ?2, ?3)",

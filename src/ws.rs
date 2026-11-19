@@ -8,16 +8,83 @@ use axum::extract::State;
 use axum::response::Response;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use uuid::Uuid;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccessMode {
+    InviteOnly,
+    Friends,
+    FriendsOfFriends,
+    Open,
+}
+
+impl AccessMode {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "invite_only" => Self::InviteOnly,
+            "friends_of_friends" => Self::FriendsOfFriends,
+            "open" => Self::Open,
+            _ => Self::Friends,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InviteOnly => "invite_only",
+            Self::Friends => "friends",
+            Self::FriendsOfFriends => "friends_of_friends",
+            Self::Open => "open",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InvitePerm {
+    HostOnly,
+    Operators,
+    Anyone,
+}
+
+impl InvitePerm {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "operators" => Self::Operators,
+            "anyone" => Self::Anyone,
+            _ => Self::HostOnly,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HostOnly => "host_only",
+            Self::Operators => "operators",
+            Self::Anyone => "anyone",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct HostedSession {
+    pub world_name: String,
+    pub access: AccessMode,
+    pub invite_perm: InvitePerm,
+    pub locked: bool,
+    pub max_players: u32,
+    pub player_count: u32,
+    /// invitee uuid -> (inviter uuid, inviter name)
+    pub invites: HashMap<Uuid, (Uuid, String)>,
+    pub operators: HashSet<Uuid>,
+    pub banned: HashSet<Uuid>,
+}
 
 pub struct App {
     pub db: Mutex<rusqlite::Connection>,
     pub hub: hub::Hub,
     pub relay: relay::Relay,
-    pub sessions: tokio::sync::Mutex<HashMap<Uuid, String>>,
+    pub sessions: tokio::sync::Mutex<HashMap<Uuid, HostedSession>>,
     pub dev_mode: bool,
     pub admin_token: Option<String>,
     /// Discord OAuth gate for the dashboard (all optional until configured).
@@ -84,10 +151,13 @@ async fn run_client(app: Arc<App>, socket: WebSocket) {
     if let Some(me) = identity {
         if app.hub.remove_owned(&me, conn_id).await.is_some() {
             // A host that vanished takes its hosted-world session with it.
-            app.sessions.lock().await.remove(&me);
+            let prev_session = app.sessions.lock().await.remove(&me);
             {
                 let conn = app.db.lock().unwrap();
                 db::log_event(&conn, "disconnect", None);
+            }
+            if prev_session.is_some() {
+                push_session_state(&app, &me, prev_session.as_ref()).await;
             }
             broadcast_presence(&app, &me).await;
         }
@@ -132,8 +202,16 @@ async fn handle_message(
             Some(me) => session_open(app, me, tx, v).await,
             None => send(tx, error_op("say hello first")).await,
         },
+        "session.update" => match identity {
+            Some(me) => session_update(app, me, tx, v).await,
+            None => send(tx, error_op("say hello first")).await,
+        },
         "session.close" => match identity {
             Some(me) => session_close(app, me).await,
+            None => send(tx, error_op("say hello first")).await,
+        },
+        "session.invite" => match identity {
+            Some(me) => session_invite(app, me, tx, v).await,
             None => send(tx, error_op("say hello first")).await,
         },
         "join.begin" => match identity {
@@ -203,31 +281,89 @@ async fn hello(app: &Arc<App>, identity: &mut Option<Uuid>, tx: &Tx, conn_id: u6
     broadcast_presence(app, &uuid).await;
 }
 
+/// Can `viewer` see `session` (owned by `host`) in their friends / discoverable list?
+fn visible_to_friend(session: &HostedSession, viewer: &Uuid) -> bool {
+    if session.banned.contains(viewer) {
+        return false;
+    }
+    session.access != AccessMode::InviteOnly || session.invites.contains_key(viewer)
+}
+
 /// Build the friends.sync payload for one user: friends (with live
-/// presence), incoming requests, outgoing requests.
+/// presence), incoming requests, outgoing requests, and discoverable
+/// non-friend worlds (friends-of-friends, open, or explicit invites).
 async fn build_sync(app: &App, me: &Uuid) -> String {
-    let (friend_pairs, incoming, outgoing) = {
+    let (friend_pairs, fof_pairs, incoming, outgoing) = {
         let conn = app.db.lock().unwrap();
         let friends = db::friends_with_names(&conn, me);
+        let fof = db::friends_of_friends(&conn, me);
         let incoming = db::incoming_requests(&conn, me);
         let outgoing = db::outgoing_requests(&conn, me);
-        (friends, incoming, outgoing)
+        (friends, fof, incoming, outgoing)
     };
 
-    let world_names: HashMap<Uuid, String> = app.sessions.lock().await.clone();
+    let sessions: HashMap<Uuid, HostedSession> = app.sessions.lock().await.clone();
+    let friend_set: HashSet<Uuid> = friend_pairs.iter().map(|(u, _)| *u).collect();
+    let fof_map: HashMap<Uuid, String> = fof_pairs.into_iter().collect();
 
     let mut friends: Vec<Value> = Vec::new();
     for (u, name) in &friend_pairs {
         let online = app.hub.is_online(u).await;
-        let world = world_names.get(u).cloned().unwrap_or_default();
+        let visible_sess = sessions.get(u).filter(|s| visible_to_friend(s, me));
         friends.push(json!({
             "uuid": u.to_string(),
             "name": name,
             "presence": if online { "online" } else { "offline" },
-            "hosting": world_names.contains_key(u),
-            "worldName": world,
+            "hosting": visible_sess.is_some(),
+            "worldName": visible_sess.map(|s| s.world_name.as_str()).unwrap_or(""),
+            "access": visible_sess.map(|s| s.access.as_str()).unwrap_or(""),
+            "locked": visible_sess.map(|s| s.locked).unwrap_or(false),
+            "playerCount": visible_sess.map(|s| s.player_count).unwrap_or(0),
+            "maxPlayers": visible_sess.map(|s| s.max_players).unwrap_or(0),
         }));
     }
+
+    // Non-friend sessions this user can see & join (invited, FOF, or Open).
+    let mut discoverable: Vec<Value> = Vec::new();
+    for (host_uuid, sess) in &sessions {
+        if host_uuid == me || friend_set.contains(host_uuid) || sess.banned.contains(me) {
+            continue;
+        }
+        let via = if let Some((_, inviter_name)) = sess.invites.get(me) {
+            Some(("invite", inviter_name.clone()))
+        } else if sess.access == AccessMode::FriendsOfFriends {
+            fof_map
+                .get(host_uuid)
+                .map(|via_name| ("friend_of_friend", via_name.clone()))
+        } else if sess.access == AccessMode::Open {
+            let via_name = fof_map.get(host_uuid).cloned().unwrap_or_default();
+            let kind = if via_name.is_empty() { "open" } else { "friend_of_friend" };
+            Some((kind, via_name))
+        } else {
+            None
+        };
+        if let Some((source, via_name)) = via {
+            let host_name = match app.hub.name(host_uuid).await {
+                Some(n) => n,
+                None => {
+                    let conn = app.db.lock().unwrap();
+                    db::user_name_by_uuid(&conn, host_uuid).unwrap_or_else(|| "?".into())
+                }
+            };
+            discoverable.push(json!({
+                "host": host_uuid.to_string(),
+                "hostName": host_name,
+                "worldName": sess.world_name,
+                "access": sess.access.as_str(),
+                "source": source,
+                "viaName": via_name,
+                "locked": sess.locked,
+                "playerCount": sess.player_count,
+                "maxPlayers": sess.max_players,
+            }));
+        }
+    }
+
     let incoming: Vec<Value> = incoming
         .iter()
         .map(|(u, name)| json!({"uuid": u.to_string(), "name": name}))
@@ -237,7 +373,14 @@ async fn build_sync(app: &App, me: &Uuid) -> String {
         .map(|(u, name)| json!({"uuid": u.to_string(), "name": name}))
         .collect();
 
-    json!({"op": "friends.sync", "friends": friends, "incoming": incoming, "outgoing": outgoing}).to_string()
+    json!({
+        "op": "friends.sync",
+        "friends": friends,
+        "discoverable": discoverable,
+        "incoming": incoming,
+        "outgoing": outgoing
+    })
+    .to_string()
 }
 
 async fn friend_add(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
@@ -369,27 +512,183 @@ async fn friend_remove(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
     }
 }
 
+fn parse_uuid_set(v: &Value, key: &str) -> Option<HashSet<Uuid>> {
+    let arr = v.get(key)?.as_array()?;
+    Some(
+        arr.iter()
+            .filter_map(Value::as_str)
+            .filter_map(|s| Uuid::parse_str(s).ok())
+            .collect(),
+    )
+}
+
+fn apply_session_fields(sess: &mut HostedSession, v: &Value) {
+    if let Some(world) = v.get("worldName").and_then(Value::as_str) {
+        if !world.is_empty() {
+            sess.world_name = world.to_string();
+        }
+    }
+    if let Some(access) = v.get("access").and_then(Value::as_str) {
+        sess.access = AccessMode::parse(access);
+    }
+    if let Some(perm) = v.get("invitePerm").and_then(Value::as_str) {
+        sess.invite_perm = InvitePerm::parse(perm);
+    }
+    if let Some(locked) = v.get("locked").and_then(Value::as_bool) {
+        sess.locked = locked;
+    }
+    if let Some(max_p) = v.get("maxPlayers").and_then(Value::as_u64) {
+        sess.max_players = (max_p as u32).clamp(1, 64);
+    }
+    if let Some(cnt) = v.get("playerCount").and_then(Value::as_u64) {
+        sess.player_count = cnt as u32;
+    }
+    if let Some(ops) = parse_uuid_set(v, "operators") {
+        sess.operators = ops;
+    }
+    if let Some(banned) = parse_uuid_set(v, "banned") {
+        sess.banned = banned;
+    }
+}
+
 async fn session_open(app: &Arc<App>, me: &Uuid, _tx: &Tx, v: &Value) {
-    let world_name = v
-        .get("worldName")
-        .and_then(Value::as_str)
-        .unwrap_or("a world")
-        .to_string();
-    app.sessions.lock().await.insert(*me, world_name);
-    {
+    let prev = {
+        let mut sessions = app.sessions.lock().await;
+        let prev = sessions.get(me).cloned();
+        let mut sess = prev.clone().unwrap_or_else(|| HostedSession {
+            world_name: "a world".into(),
+            access: AccessMode::Friends,
+            invite_perm: InvitePerm::HostOnly,
+            locked: false,
+            max_players: 8,
+            player_count: 1,
+            invites: HashMap::new(),
+            operators: HashSet::new(),
+            banned: HashSet::new(),
+        });
+        apply_session_fields(&mut sess, v);
+        sessions.insert(*me, sess);
+        prev
+    };
+    if prev.is_none() {
         let conn = app.db.lock().unwrap();
         db::log_event(&conn, "session_open", None);
     }
-    push_session_state(app, me).await;
+    push_session_state(app, me, prev.as_ref()).await;
+}
+
+async fn session_update(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
+    let prev = {
+        let mut sessions = app.sessions.lock().await;
+        let Some(existing) = sessions.get_mut(me) else {
+            send(tx, error_op("no active hosted session to update")).await;
+            return;
+        };
+        let prev = existing.clone();
+        apply_session_fields(existing, v);
+        prev
+    };
+    push_session_state(app, me, Some(&prev)).await;
 }
 
 async fn session_close(app: &Arc<App>, me: &Uuid) {
-    app.sessions.lock().await.remove(me);
+    let prev = app.sessions.lock().await.remove(me);
     {
         let conn = app.db.lock().unwrap();
         db::log_event(&conn, "session_close", None);
     }
-    push_session_state(app, me).await;
+    push_session_state(app, me, prev.as_ref()).await;
+}
+
+async fn session_invite(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
+    // Target may be specified by uuid or by profile name.
+    let target = if let Some(u) = v
+        .get("uuid")
+        .and_then(Value::as_str)
+        .and_then(|s| Uuid::parse_str(s).ok())
+    {
+        Some(u)
+    } else if let Some(name) = v.get("name").and_then(Value::as_str) {
+        let conn = app.db.lock().unwrap();
+        db::user_by_name(&conn, name).map(|(u, _)| u)
+    } else {
+        None
+    };
+    let Some(target_uuid) = target else {
+        send(tx, error_op("session.invite requires a target uuid or name")).await;
+        return;
+    };
+    let host_uuid = v
+        .get("host")
+        .and_then(Value::as_str)
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .unwrap_or(*me);
+    if target_uuid == host_uuid {
+        send(tx, error_op("that player is already the host")).await;
+        return;
+    }
+
+    let inviter_name = match app.hub.name(me).await {
+        Some(n) => n,
+        None => {
+            let conn = app.db.lock().unwrap();
+            db::user_name_by_uuid(&conn, me).unwrap_or_else(|| "?".into())
+        }
+    };
+    let host_name = match app.hub.name(&host_uuid).await {
+        Some(n) => n,
+        None => {
+            let conn = app.db.lock().unwrap();
+            db::user_name_by_uuid(&conn, &host_uuid).unwrap_or_else(|| "?".into())
+        }
+    };
+
+    let world_name = {
+        let mut sessions = app.sessions.lock().await;
+        let Some(sess) = sessions.get_mut(&host_uuid) else {
+            send(tx, error_op("no active hosted world to invite to")).await;
+            return;
+        };
+        let allowed = host_uuid == *me
+            || match sess.invite_perm {
+                InvitePerm::HostOnly => false,
+                InvitePerm::Operators => sess.operators.contains(me),
+                InvitePerm::Anyone => true,
+            };
+        if !allowed {
+            send(tx, error_op("you don't have permission to invite to this world")).await;
+            return;
+        }
+        if sess.banned.contains(&target_uuid) {
+            send(tx, error_op("that player is banned from this world")).await;
+            return;
+        }
+        sess.invites.insert(target_uuid, (*me, inviter_name.clone()));
+        sess.world_name.clone()
+    };
+
+    {
+        let conn = app.db.lock().unwrap();
+        db::log_event(&conn, "session_invite", None);
+    }
+
+    if let Some(target_tx) = app.hub.tx(&target_uuid).await {
+        send(
+            &target_tx,
+            json!({
+                "op": "invite.received",
+                "host": host_uuid.to_string(),
+                "hostName": host_name,
+                "worldName": world_name,
+                "invitedBy": me.to_string(),
+                "invitedByName": inviter_name,
+            })
+            .to_string(),
+        )
+        .await;
+        // Also refresh the invitee's view of the host session so it becomes joinable immediately.
+        send(&target_tx, build_sync(app, &target_uuid).await).await;
+    }
 }
 
 async fn join_begin(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
@@ -401,23 +700,83 @@ async fn join_begin(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
         send(tx, error_op("that's your own world 🙂")).await;
         return;
     }
-    // Only actual friends may open a room into someone's world.
-    let friends = {
-        let conn = app.db.lock().unwrap();
-        db::are_friends(&conn, me, &host)
-    };
-    if !friends {
-        send(tx, error_op("you are not friends with that host")).await;
-        return;
-    }
-    let host_world = app.sessions.lock().await.get(&host).cloned();
-    let Some(world) = host_world else {
-        send(tx, error_op("that friend is not hosting right now")).await;
+    let session = app.sessions.lock().await.get(&host).cloned();
+    let Some(sess) = session else {
+        send(tx, error_op("that player is not hosting right now")).await;
         return;
     };
     let Some(host_tx) = app.hub.tx(&host).await else {
-        send(tx, error_op("that friend is not online")).await;
+        send(tx, error_op("that host is not online")).await;
         return;
+    };
+    if sess.banned.contains(me) {
+        send(tx, error_op("you are banned from this world")).await;
+        return;
+    }
+    if sess.locked {
+        send(tx, error_op("this world is currently locked")).await;
+        return;
+    }
+    if sess.player_count >= sess.max_players {
+        send(tx, error_op("this world is full")).await;
+        return;
+    }
+
+    let (direct_friend, mutual) = {
+        let conn = app.db.lock().unwrap();
+        let direct = db::are_friends(&conn, me, &host);
+        let mutual = if direct {
+            None
+        } else {
+            db::mutual_friend(&conn, &host, me)
+        };
+        (direct, mutual)
+    };
+
+    let invite_info = sess.invites.get(me).cloned();
+    let (join_source, via_name): (&str, String) = if let Some((_, inviter_name)) = invite_info {
+        ("invite", inviter_name)
+    } else {
+        match sess.access {
+            AccessMode::InviteOnly => {
+                send(tx, error_op("this world is invite-only")).await;
+                return;
+            }
+            AccessMode::Friends => {
+                if !direct_friend {
+                    send(tx, error_op("you are not friends with that host")).await;
+                    return;
+                }
+                ("friend", String::new())
+            }
+            AccessMode::FriendsOfFriends => {
+                if direct_friend {
+                    ("friend", String::new())
+                } else if let Some((_, mutual_name)) = mutual {
+                    ("friend_of_friend", mutual_name)
+                } else {
+                    send(tx, error_op("this world is limited to friends of friends")).await;
+                    return;
+                }
+            }
+            AccessMode::Open => {
+                if direct_friend {
+                    ("friend", String::new())
+                } else if let Some((_, mutual_name)) = mutual {
+                    ("friend_of_friend", mutual_name)
+                } else {
+                    ("open", String::new())
+                }
+            }
+        }
+    };
+
+    let joiner_name = match app.hub.name(me).await {
+        Some(n) => n,
+        None => {
+            let conn = app.db.lock().unwrap();
+            db::user_name_by_uuid(&conn, me).unwrap_or_else(|| "?".into())
+        }
     };
 
     let (room_id, host_token, joiner_token) = app.relay.create_room(app, *me);
@@ -431,7 +790,7 @@ async fn join_begin(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
         json!({
             "op": "join.ready",
             "host": host.to_string(),
-            "worldName": world,
+            "worldName": sess.world_name,
             "roomId": room_id.to_string(),
             "token": joiner_token,
             "relayPath": "/relay/ws"
@@ -441,8 +800,17 @@ async fn join_begin(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
     .await;
     send(
         &host_tx,
-        json!({"op": "relay.host", "roomId": room_id.to_string(), "token": host_token, "relayPath": "/relay/ws"})
-            .to_string(),
+        json!({
+            "op": "relay.host",
+            "roomId": room_id.to_string(),
+            "token": host_token,
+            "relayPath": "/relay/ws",
+            "joinerUuid": me.to_string(),
+            "joinerName": joiner_name,
+            "joinSource": join_source,
+            "viaName": via_name,
+        })
+        .to_string(),
     )
     .await;
 }
@@ -458,50 +826,122 @@ async fn push_presence_to_friends(app: &Arc<App>, me: &Uuid) {
         db::friend_uuids(&conn, me)
     };
     let online = app.hub.is_online(me).await;
-    let hosting_world = app.sessions.lock().await.get(me).cloned();
-    let update = json!({
-        "op": "presence.batch",
-        "updates": [{
-            "uuid": me.to_string(),
-            "presence": if online { "online" } else { "offline" },
-            "hosting": hosting_world.is_some(),
-            "worldName": hosting_world.clone().unwrap_or_default(),
-        }]
-    })
-    .to_string();
+    let sess = app.sessions.lock().await.get(me).cloned();
     for friend in friends {
         if friend == *me {
             continue;
         }
+        let visible = sess.as_ref().filter(|s| visible_to_friend(s, &friend));
+        let update = json!({
+            "op": "presence.batch",
+            "updates": [{
+                "uuid": me.to_string(),
+                "presence": if online { "online" } else { "offline" },
+                "hosting": visible.is_some(),
+                "worldName": visible.map(|s| s.world_name.as_str()).unwrap_or(""),
+            }]
+        })
+        .to_string();
         if let Some(tx) = app.hub.tx(&friend).await {
-            send(&tx, update.clone()).await;
+            send(&tx, update).await;
         }
     }
 }
 
-async fn push_session_state(app: &Arc<App>, me: &Uuid) {
-    let friends = {
+async fn push_session_state(app: &Arc<App>, me: &Uuid, prev: Option<&HostedSession>) {
+    let (friends, fof_pairs, host_name) = {
         let conn = app.db.lock().unwrap();
-        db::friend_uuids(&conn, me)
+        let friends = db::friend_uuids(&conn, me);
+        let fof = db::friends_of_friends(&conn, me);
+        let name = db::user_name_by_uuid(&conn, me);
+        (friends, fof, name)
     };
-    let world = app.sessions.lock().await.get(me).cloned();
-    let state = json!({
-        "op": "session.state",
-        "sessions": [{
-            "host": me.to_string(),
-            "worldName": world.clone().unwrap_or_default(),
-            "active": world.is_some(),
-        }]
-    })
-    .to_string();
-    for friend in friends {
-        if let Some(tx) = app.hub.tx(&friend).await {
-            send(&tx, state.clone()).await;
-        }
+    let host_name = match app.hub.name(me).await {
+        Some(n) => n,
+        None => host_name.unwrap_or_else(|| "?".into()),
+    };
+    let curr = app.sessions.lock().await.get(me).cloned();
+    let friend_set: HashSet<Uuid> = friends.iter().copied().collect();
+    let fof_map: HashMap<Uuid, String> = fof_pairs.into_iter().collect();
+
+    // Determine who should receive an update: all friends, plus FOF / invitees /
+    // online users if either the previous or current session reached them.
+    let mut recipients: HashSet<Uuid> = friends.into_iter().collect();
+    let involves_fof = prev.is_some_and(|s| s.access == AccessMode::FriendsOfFriends)
+        || curr.as_ref().is_some_and(|s| s.access == AccessMode::FriendsOfFriends);
+    let involves_open = prev.is_some_and(|s| s.access == AccessMode::Open)
+        || curr.as_ref().is_some_and(|s| s.access == AccessMode::Open);
+    if involves_fof {
+        recipients.extend(fof_map.keys().copied());
     }
-    // The host itself also receives its own session state.
-    if let Some(tx) = app.hub.tx(me).await {
-        send(&tx, state.clone()).await;
+    if involves_open {
+        recipients.extend(app.hub.online_uuids().await);
+    }
+    if let Some(p) = prev {
+        recipients.extend(p.invites.keys().copied());
+    }
+    if let Some(c) = &curr {
+        recipients.extend(c.invites.keys().copied());
+    }
+    recipients.insert(*me);
+
+    for recipient in recipients {
+        let Some(tx) = app.hub.tx(&recipient).await else {
+            continue;
+        };
+        let is_self = recipient == *me;
+        let is_friend = friend_set.contains(&recipient);
+        let (visible, source, via_name) = match &curr {
+            None => (false, "", String::new()),
+            Some(s) if is_self => (true, "host", String::new()),
+            Some(s) if s.banned.contains(&recipient) => (false, "", String::new()),
+            Some(s) if s.invites.contains_key(&recipient) => (
+                true,
+                "invite",
+                s.invites.get(&recipient).map(|(_, n)| n.clone()).unwrap_or_default(),
+            ),
+            Some(s) => match s.access {
+                AccessMode::InviteOnly => (false, "", String::new()),
+                AccessMode::Friends => (is_friend, "friend", String::new()),
+                AccessMode::FriendsOfFriends => {
+                    if is_friend {
+                        (true, "friend", String::new())
+                    } else if let Some(via) = fof_map.get(&recipient) {
+                        (true, "friend_of_friend", via.clone())
+                    } else {
+                        (false, "", String::new())
+                    }
+                }
+                AccessMode::Open => {
+                    if is_friend {
+                        (true, "friend", String::new())
+                    } else if let Some(via) = fof_map.get(&recipient) {
+                        (true, "friend_of_friend", via.clone())
+                    } else {
+                        (true, "open", String::new())
+                    }
+                }
+            },
+        };
+
+        let payload = json!({
+            "op": "session.state",
+            "sessions": [{
+                "host": me.to_string(),
+                "hostName": host_name,
+                "worldName": if visible { curr.as_ref().map(|s| s.world_name.as_str()).unwrap_or("") } else { "" },
+                "active": visible,
+                "access": if visible { curr.as_ref().map(|s| s.access.as_str()).unwrap_or("") } else { "" },
+                "invitePerm": if visible { curr.as_ref().map(|s| s.invite_perm.as_str()).unwrap_or("") } else { "" },
+                "source": source,
+                "viaName": via_name,
+                "locked": if visible { curr.as_ref().map(|s| s.locked).unwrap_or(false) } else { false },
+                "playerCount": if visible { curr.as_ref().map(|s| s.player_count).unwrap_or(0) } else { 0 },
+                "maxPlayers": if visible { curr.as_ref().map(|s| s.max_players).unwrap_or(0) } else { 0 },
+            }]
+        })
+        .to_string();
+        send(&tx, payload).await;
     }
 }
 
