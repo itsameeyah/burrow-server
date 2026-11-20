@@ -69,6 +69,8 @@ impl InvitePerm {
 
 const INVITE_TTL_SECS: i64 = 30;
 const AUTH_CHALLENGE_TTL_SECS: i64 = 30;
+const AUTH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(45);
+const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
 const MOJANG_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 const RATE_LIMIT_MAX: usize = 40;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(5);
@@ -88,6 +90,9 @@ pub struct HostedSession {
     pub invites: HashMap<Uuid, (Uuid, String, i64)>,
     pub operators: HashSet<Uuid>,
     pub banned: HashSet<Uuid>,
+    /// Players who have already opened a game join room for this session
+    /// (allowed to open/reconnect auxiliary voice tunnels even if world fills/locks).
+    pub active_joiners: HashSet<Uuid>,
 }
 
 impl HostedSession {
@@ -158,9 +163,28 @@ async fn run_client(app: Arc<App>, socket: WebSocket) {
 
     let writer = tokio::spawn(async move {
         use futures_util::SinkExt;
-        while let Some(msg) = rx.recv().await {
-            if sink.send(Message::Text(msg.into())).await.is_err() {
-                break;
+        let mut ping_tick = tokio::time::interval(WS_PING_INTERVAL);
+        ping_tick.tick().await; // skip immediate first tick
+        loop {
+            tokio::select! {
+                maybe_msg = rx.recv() => {
+                    match maybe_msg {
+                        Some(msg) => {
+                            if sink.send(Message::Text(msg.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => {
+                            let _ = sink.send(Message::Close(None)).await;
+                            break;
+                        }
+                    }
+                }
+                _ = ping_tick.tick() => {
+                    if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -169,8 +193,25 @@ async fn run_client(app: Arc<App>, socket: WebSocket) {
     let mut pending_auth: Option<PendingAuth> = None;
     let mut msg_times: VecDeque<Instant> = VecDeque::with_capacity(RATE_LIMIT_MAX);
     let mut rate_strikes: u32 = 0;
+    let auth_deadline = tokio::time::Instant::now() + AUTH_HANDSHAKE_TIMEOUT;
 
-    while let Some(Ok(msg)) = stream.next().await {
+    loop {
+        let next_frame = if identity.is_none() {
+            match tokio::time::timeout_at(auth_deadline, stream.next()).await {
+                Ok(frame) => frame,
+                Err(_) => {
+                    tracing::info!("closing unauthenticated signaling connection {conn_id} after handshake timeout");
+                    break;
+                }
+            }
+        } else {
+            stream.next().await
+        };
+
+        let Some(Ok(msg)) = next_frame else {
+            break;
+        };
+
         match msg {
             Message::Text(text) => {
                 let now_inst = Instant::now();
@@ -204,8 +245,11 @@ async fn run_client(app: Arc<App>, socket: WebSocket) {
                 let Some(op) = value.get("op").and_then(Value::as_str) else {
                     continue;
                 };
-                handle_message(&app, &mut identity, &mut pending_auth, &tx, conn_id, op, &value)
-                    .await;
+                if handle_message(&app, &mut identity, &mut pending_auth, &tx, conn_id, op, &value)
+                    .await
+                {
+                    break;
+                }
             }
             Message::Close(_) => break,
             _ => {}
@@ -234,6 +278,7 @@ async fn run_client(app: Arc<App>, socket: WebSocket) {
     let _ = writer.await;
 }
 
+/// Returns `true` when the connection should be closed after flushing queued messages.
 async fn handle_message(
     app: &Arc<App>,
     identity: &mut Option<Uuid>,
@@ -242,10 +287,10 @@ async fn handle_message(
     conn_id: u64,
     op: &str,
     v: &Value,
-) {
+) -> bool {
     match op {
         "hello" => hello(app, identity, pending_auth, tx, conn_id, v).await,
-        "auth.verify" => auth_verify(app, identity, pending_auth, tx, conn_id, v).await,
+        "auth.verify" => return auth_verify(app, identity, pending_auth, tx, conn_id, v).await,
         "friends.sync" => {
             if let Some(me) = identity {
                 send(tx, build_sync(app, me).await).await;
@@ -301,6 +346,7 @@ async fn handle_message(
         },
         other => send(tx, error_op(format!("unknown op '{other}'"))).await,
     }
+    false
 }
 
 async fn hello(
@@ -361,6 +407,8 @@ async fn hello(
     }
 }
 
+/// Returns `true` when verification failed and the socket should be closed so
+/// the client cleanly triggers reconnect/backoff instead of idling unauthenticated.
 async fn auth_verify(
     app: &Arc<App>,
     identity: &mut Option<Uuid>,
@@ -368,25 +416,26 @@ async fn auth_verify(
     tx: &Tx,
     conn_id: u64,
     v: &Value,
-) {
-    const FAIL_MSG: &str = "Mojang verification failed — please restart Minecraft";
+) -> bool {
+    const FAIL_MSG: &str = "Mojang verification failed — retrying...";
+    const BUSY_MSG: &str = "Mojang auth servers are busy — retrying...";
 
     if identity.is_some() {
         send(tx, error_op("this connection is already identified")).await;
-        return;
+        return false;
     }
     // Consume the pending challenge immediately so it is strictly single-use.
     let Some(pending) = pending_auth.take() else {
         send(tx, error_op(FAIL_MSG)).await;
-        return;
+        return true;
     };
     let Some(server_id) = v.get("serverId").and_then(Value::as_str) else {
         send(tx, error_op(FAIL_MSG)).await;
-        return;
+        return true;
     };
     if server_id != pending.server_id || db::now() > pending.expires_at {
         send(tx, error_op(FAIL_MSG)).await;
-        return;
+        return true;
     }
 
     let url = format!(
@@ -399,23 +448,29 @@ async fn auth_verify(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("mojang hasJoined request failed for {}: {}", pending.claimed_name, e);
-            send(tx, error_op(FAIL_MSG)).await;
-            return;
+            send(tx, error_op(BUSY_MSG)).await;
+            return true;
         }
     };
     if res.status() != reqwest::StatusCode::OK {
+        let status = res.status();
         tracing::info!(
             "mojang hasJoined rejected {} with status {}",
             pending.claimed_name,
-            res.status()
+            status
         );
-        send(tx, error_op(FAIL_MSG)).await;
-        return;
+        let msg = if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+            BUSY_MSG
+        } else {
+            FAIL_MSG
+        };
+        send(tx, error_op(msg)).await;
+        return true;
     }
     let Ok(body) = res.json::<Value>().await else {
         tracing::warn!("mojang hasJoined returned invalid JSON for {}", pending.claimed_name);
         send(tx, error_op(FAIL_MSG)).await;
-        return;
+        return true;
     };
     let Some(uuid) = body
         .get("id")
@@ -424,7 +479,7 @@ async fn auth_verify(
     else {
         tracing::warn!("mojang hasJoined missing valid id for {}", pending.claimed_name);
         send(tx, error_op(FAIL_MSG)).await;
-        return;
+        return true;
     };
     let Some(name) = body
         .get("name")
@@ -435,10 +490,11 @@ async fn auth_verify(
     else {
         tracing::warn!("mojang hasJoined missing valid name for {}", pending.claimed_name);
         send(tx, error_op(FAIL_MSG)).await;
-        return;
+        return true;
     };
 
     complete_login(app, identity, tx, conn_id, uuid, name).await;
+    false
 }
 
 async fn complete_login(
@@ -799,6 +855,7 @@ async fn session_open(app: &Arc<App>, me: &Uuid, _tx: &Tx, v: &Value) {
             invites: HashMap::new(),
             operators: HashSet::new(),
             banned: HashSet::new(),
+            active_joiners: HashSet::new(),
         });
         apply_session_fields(&mut sess, v);
         sessions.insert(*me, sess);
@@ -932,6 +989,7 @@ async fn join_begin(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
         send(tx, error_op("join.begin requires a host uuid")).await;
         return;
     };
+    let is_voice = v.get("channel").and_then(Value::as_str) == Some("voice");
     if host == *me {
         send(tx, error_op("that's your own world 🙂")).await;
         return;
@@ -949,67 +1007,77 @@ async fn join_begin(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
         send(tx, error_op("you are banned from this world")).await;
         return;
     }
-    if sess.locked {
-        send(tx, error_op("this world is currently locked")).await;
-        return;
-    }
-    if sess.player_count >= sess.max_players {
-        send(tx, error_op("this world is full")).await;
-        return;
+    // Voice tunnels for players who already opened a game room on this session
+    // bypass lock/cap/invite-expiry checks so SVC works even in a full or
+    // freshly locked world.
+    let already_joined = is_voice && sess.active_joiners.contains(me);
+    if !already_joined {
+        if sess.locked {
+            send(tx, error_op("this world is currently locked")).await;
+            return;
+        }
+        if !is_voice && sess.player_count >= sess.max_players {
+            send(tx, error_op("this world is full")).await;
+            return;
+        }
     }
 
-    let (direct_friend, mutual, in_network) = {
-        let conn = app.db.lock().unwrap();
-        let direct = db::are_friends(&conn, me, &host);
-        let mutual = if direct {
-            None
-        } else {
-            db::mutual_friend(&conn, &host, me)
-        };
-        let in_net = if direct || mutual.is_some() || sess.access != AccessMode::Open {
-            direct || mutual.is_some()
-        } else {
-            db::in_friend_network(&conn, &host, me)
-        };
-        (direct, mutual, in_net)
-    };
-
-    let invite_info = sess.active_invite(me).cloned();
-    let (join_source, via_name): (&str, String) = if let Some((_, inviter_name, _)) = invite_info {
-        ("invite", inviter_name)
+    let (join_source, via_name): (&str, String) = if already_joined {
+        ("voice", String::new())
     } else {
-        match sess.access {
-            AccessMode::InviteOnly => {
-                send(tx, error_op("this world is invite-only")).await;
-                return;
-            }
-            AccessMode::Friends => {
-                if !direct_friend {
-                    send(tx, error_op("you are not friends with that host")).await;
+        let (direct_friend, mutual, in_network) = {
+            let conn = app.db.lock().unwrap();
+            let direct = db::are_friends(&conn, me, &host);
+            let mutual = if direct {
+                None
+            } else {
+                db::mutual_friend(&conn, &host, me)
+            };
+            let in_net = if direct || mutual.is_some() || sess.access != AccessMode::Open {
+                direct || mutual.is_some()
+            } else {
+                db::in_friend_network(&conn, &host, me)
+            };
+            (direct, mutual, in_net)
+        };
+
+        let invite_info = sess.active_invite(me).cloned();
+        if let Some((_, inviter_name, _)) = invite_info {
+            ("invite", inviter_name)
+        } else {
+            match sess.access {
+                AccessMode::InviteOnly => {
+                    send(tx, error_op("this world is invite-only")).await;
                     return;
                 }
-                ("friend", String::new())
-            }
-            AccessMode::FriendsOfFriends => {
-                if direct_friend {
+                AccessMode::Friends => {
+                    if !direct_friend {
+                        send(tx, error_op("you are not friends with that host")).await;
+                        return;
+                    }
                     ("friend", String::new())
-                } else if let Some((_, mutual_name)) = mutual {
-                    ("friend_of_friend", mutual_name)
-                } else {
-                    send(tx, error_op("this world is limited to friends of friends")).await;
-                    return;
                 }
-            }
-            AccessMode::Open => {
-                if direct_friend {
-                    ("friend", String::new())
-                } else if let Some((_, mutual_name)) = mutual {
-                    ("friend_of_friend", mutual_name)
-                } else if in_network {
-                    ("open", String::new())
-                } else {
-                    send(tx, error_op("this world is limited to the host's friend network")).await;
-                    return;
+                AccessMode::FriendsOfFriends => {
+                    if direct_friend {
+                        ("friend", String::new())
+                    } else if let Some((_, mutual_name)) = mutual {
+                        ("friend_of_friend", mutual_name)
+                    } else {
+                        send(tx, error_op("this world is limited to friends of friends")).await;
+                        return;
+                    }
+                }
+                AccessMode::Open => {
+                    if direct_friend {
+                        ("friend", String::new())
+                    } else if let Some((_, mutual_name)) = mutual {
+                        ("friend_of_friend", mutual_name)
+                    } else if in_network {
+                        ("open", String::new())
+                    } else {
+                        send(tx, error_op("this world is limited to the host's friend network")).await;
+                        return;
+                    }
                 }
             }
         }
@@ -1027,6 +1095,43 @@ async fn join_begin(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
         send(tx, error_op("that host has too many active connections right now")).await;
         return;
     };
+
+    if is_voice {
+        {
+            let conn = app.db.lock().unwrap();
+            db::log_event(&conn, "voice_begin", None);
+        }
+        send(
+            tx,
+            json!({
+                "op": "voice.ready",
+                "host": host.to_string(),
+                "roomId": room_id.to_string(),
+                "token": joiner_token,
+                "relayPath": "/relay/ws"
+            })
+            .to_string(),
+        )
+        .await;
+        send(
+            &host_tx,
+            json!({
+                "op": "relay.voice",
+                "roomId": room_id.to_string(),
+                "token": host_token,
+                "relayPath": "/relay/ws",
+                "joinerUuid": me.to_string(),
+                "joinerName": joiner_name,
+            })
+            .to_string(),
+        )
+        .await;
+        return;
+    }
+
+    if let Some(live) = app.sessions.lock().await.get_mut(&host) {
+        live.active_joiners.insert(*me);
+    }
     {
         let conn = app.db.lock().unwrap();
         db::log_event(&conn, "join_begin", None);
