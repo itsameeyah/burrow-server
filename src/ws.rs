@@ -140,6 +140,12 @@ pub struct App {
     pub dev_mode: bool,
     /// Base URL for Mojang sessionserver (overridable via BURROW_MOJANG_SESSION_URL for tests).
     pub mojang_session_url: String,
+    /// Latest available Burrow mod version (SemVer, e.g. "0.5.0").
+    pub latest_mod_version: String,
+    /// Minimum compatible Burrow mod version (SemVer; older versions show a breaking update warning).
+    pub min_mod_version: String,
+    /// Download URL opened when the player clicks Update in-game.
+    pub download_url: String,
     pub admin_token: Option<String>,
     /// Discord OAuth gate for the dashboard (all optional until configured).
     pub discord_client_id: Option<String>,
@@ -155,6 +161,14 @@ pub struct App {
 }
 
 type Tx = mpsc::Sender<String>;
+
+pub async fn version_handler(State(app): State<Arc<App>>) -> axum::Json<Value> {
+    axum::Json(json!({
+        "latestModVersion": app.latest_mod_version,
+        "minModVersion": app.min_mod_version,
+        "downloadUrl": app.download_url,
+    }))
+}
 
 pub async fn ws_handler(State(app): State<Arc<App>>, upgrade: WebSocketUpgrade) -> Response {
     upgrade.on_upgrade(move |socket| run_client(app, socket))
@@ -551,7 +565,19 @@ async fn complete_login(
         .await;
     *identity = Some(uuid);
 
-    send(tx, json!({"op": "welcome", "uuid": uuid.to_string(), "name": name}).to_string()).await;
+    send(
+        tx,
+        json!({
+            "op": "welcome",
+            "uuid": uuid.to_string(),
+            "name": name,
+            "latestModVersion": app.latest_mod_version,
+            "minModVersion": app.min_mod_version,
+            "downloadUrl": app.download_url,
+        })
+        .to_string(),
+    )
+    .await;
     send(tx, build_sync(app, &uuid).await).await;
     broadcast_presence(app, &uuid).await;
 }

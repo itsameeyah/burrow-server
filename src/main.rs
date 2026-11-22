@@ -35,6 +35,21 @@ async fn main() {
         .map(|s| s.trim().trim_end_matches('/').to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "https://sessionserver.mojang.com".into());
+    let latest_mod_version = std::env::var("BURROW_LATEST_MOD_VERSION")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "0.5.0".into());
+    let min_mod_version = std::env::var("BURROW_MIN_MOD_VERSION")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "0.5.0".into());
+    let download_url = std::env::var("BURROW_DOWNLOAD_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://github.com/itsameeyah/burrow/releases/latest".into());
 
     let conn = db::open(&PathBuf::from(&db_path)).expect("failed to open database");
     let http = reqwest::Client::new();
@@ -55,6 +70,9 @@ async fn main() {
         activities: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         dev_mode,
         mojang_session_url,
+        latest_mod_version,
+        min_mod_version,
+        download_url,
         admin_token,
         discord_client_id,
         discord_client_secret,
@@ -72,6 +90,7 @@ async fn main() {
     let router = axum::Router::new()
         .route("/ws", axum::routing::get(ws::ws_handler))
         .route("/relay/ws", axum::routing::get(relay::relay_handler))
+        .route("/version", axum::routing::get(ws::version_handler))
         .route("/admin", axum::routing::get(dashboard::admin_page))
         .route("/admin/login", axum::routing::get(dashboard::oauth_login))
         .route("/admin/callback", axum::routing::get(dashboard::oauth_callback))
