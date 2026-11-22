@@ -1,3 +1,4 @@
+mod cloudflare_srv;
 mod db;
 mod dashboard;
 mod hub;
@@ -8,6 +9,7 @@ mod ws;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[tokio::main]
 async fn main() {
@@ -18,6 +20,7 @@ async fn main() {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    let tcp_config = tcp_ingress::TcpIngressConfig::from_env();
     let db_path = std::env::var("BURROW_DB").unwrap_or_else(|_| "burrow.db".into());
     let dev_mode = std::env::var("BURROW_DEV_MODE")
         .map(|v| matches!(v.trim(), "1" | "true"))
@@ -34,6 +37,15 @@ async fn main() {
         .unwrap_or_else(|| "https://sessionserver.mojang.com".into());
 
     let conn = db::open(&PathBuf::from(&db_path)).expect("failed to open database");
+    let http = reqwest::Client::new();
+    let cf_srv = cloudflare_srv::CloudflareSrv::from_env(http.clone(), tcp_config.domain.as_deref());
+
+    if let Some(ref cf) = cf_srv {
+        let cf = cf.clone();
+        tokio::spawn(async move {
+            cf.cleanup_orphans().await;
+        });
+    }
 
     let app = Arc::new(ws::App {
         db: Mutex::new(conn),
@@ -49,11 +61,12 @@ async fn main() {
         discord_redirect_uri,
         discord_allowed_user_id,
         oauth_states: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-        http: reqwest::Client::new(),
+        http,
+        cloudflare_srv: cf_srv.clone(),
     });
 
     if let Some(tb) = tcp_bind {
-        tokio::spawn(tcp_ingress::serve(app.clone(), tb));
+        tokio::spawn(tcp_ingress::serve(app.clone(), tb, tcp_config));
     }
 
     let router = axum::Router::new()
@@ -69,5 +82,34 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(&bind).await.expect("bind failed");
     tracing::info!("Burrow server listening on {} (dev_mode={})", bind, dev_mode);
-    axum::serve(listener, router).await.expect("server error");
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .expect("server error");
+
+    if let Some(cf) = cf_srv {
+        let _ = tokio::time::timeout(Duration::from_secs(5), cf.cleanup_all()).await;
+    }
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            sig.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    tracing::info!("Shutdown signal received, cleaning up...");
 }

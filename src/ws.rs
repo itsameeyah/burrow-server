@@ -148,8 +148,10 @@ pub struct App {
     pub discord_allowed_user_id: Option<String>,
     /// Short-lived CSRF states for OAuth round-trips.
     pub oauth_states: tokio::sync::Mutex<HashMap<String, i64>>,
-    /// Shared HTTP client for Discord OAuth calls.
+    /// Shared HTTP client for Discord OAuth & Cloudflare DNS API calls.
     pub http: reqwest::Client,
+    /// Optional Cloudflare dynamic SRV manager for non-25565 vanilla join codes.
+    pub cloudflare_srv: Option<Arc<crate::cloudflare_srv::CloudflareSrv>>,
 }
 
 type Tx = mpsc::Sender<String>;
@@ -283,8 +285,11 @@ async fn run_client(app: Arc<App>, socket: WebSocket) {
                 let conn = app.db.lock().unwrap();
                 db::log_event(&conn, "disconnect", None);
             }
-            if prev_session.is_some() {
-                push_session_state(&app, &me, prev_session.as_ref()).await;
+            if let Some(ref prev) = prev_session {
+                if let Some(ref cf) = app.cloudflare_srv {
+                    cf.spawn_sync(prev.join_code.clone(), None);
+                }
+                push_session_state(&app, &me, Some(prev)).await;
             }
             broadcast_presence(&app, &me).await;
         }
@@ -996,16 +1001,17 @@ async fn session_update(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
 
 async fn session_code(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
     let action = v.get("action").and_then(Value::as_str).unwrap_or("generate");
-    let code_result: Result<Option<String>, &'static str> = {
+    let code_result: Result<(Option<String>, Option<String>), &'static str> = {
         let mut sessions = app.sessions.lock().await;
         if !sessions.contains_key(me) {
             Err("start hosting before generating a join code")
         } else {
+            let prev_code = sessions.get(me).and_then(|s| s.join_code.clone());
             let next_code = match action {
                 "disable" | "off" | "clear" => None,
                 "regenerate" => Some(generate_join_code(&sessions)),
                 _ => {
-                    if let Some(existing) = sessions.get(me).and_then(|s| s.join_code.clone()) {
+                    if let Some(existing) = prev_code.clone() {
                         Some(existing)
                     } else {
                         Some(generate_join_code(&sessions))
@@ -1015,11 +1021,14 @@ async fn session_code(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
             if let Some(sess) = sessions.get_mut(me) {
                 sess.join_code = next_code.clone();
             }
-            Ok(next_code)
+            Ok((prev_code, next_code))
         }
     };
     match code_result {
-        Ok(code) => {
+        Ok((prev_code, code)) => {
+            if let Some(ref cf) = app.cloudflare_srv {
+                cf.spawn_sync(prev_code, code.clone());
+            }
             send(
                 tx,
                 json!({
@@ -1200,6 +1209,9 @@ async fn join_code(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
 
 async fn session_close(app: &Arc<App>, me: &Uuid) {
     let prev = app.sessions.lock().await.remove(me);
+    if let (Some(cf), Some(p)) = (&app.cloudflare_srv, &prev) {
+        cf.spawn_sync(p.join_code.clone(), None);
+    }
     {
         let conn = app.db.lock().unwrap();
         db::log_event(&conn, "session_close", None);

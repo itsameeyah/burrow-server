@@ -404,6 +404,7 @@ mod tests {
             discord_allowed_user_id: None,
             oauth_states: tokio::sync::Mutex::new(HashMap::new()),
             http: reqwest::Client::new(),
+            cloudflare_srv: None,
         });
 
         let host_a = Uuid::new_v4();
