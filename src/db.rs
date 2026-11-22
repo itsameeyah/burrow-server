@@ -141,6 +141,7 @@ pub fn user_name_by_uuid(conn: &Connection, uuid: &Uuid) -> Option<String> {
 
 /// Strictly 1-hop mutual friend between `a` and `b` (i.e. `a` is friends with M
 /// and M is friends with `b`). Returns `(M.uuid, M.name)` if one exists.
+#[allow(dead_code)]
 pub fn mutual_friend(conn: &Connection, a: &Uuid, b: &Uuid) -> Option<(Uuid, String)> {
     let row: Option<(String, String)> = conn
         .query_row(
@@ -157,8 +158,74 @@ pub fn mutual_friend(conn: &Connection, a: &Uuid, b: &Uuid) -> Option<(Uuid, Str
     row.and_then(|(s, name)| Uuid::parse_str(&s).ok().map(|u| (u, name)))
 }
 
+/// Returns a direct friend of BOTH `host` and `guest` who is currently in
+/// `active_players` (live-presence Friends-of-Friends check: host -> alice -> bob
+/// only when alice is currently in the world).
+pub fn mutual_friend_in_set(
+    conn: &Connection,
+    host: &Uuid,
+    guest: &Uuid,
+    active_players: &HashSet<Uuid>,
+) -> Option<(Uuid, String)> {
+    if host == guest || active_players.is_empty() {
+        return None;
+    }
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT f1.b, u.name \
+         FROM friendships f1 \
+         JOIN friendships f2 ON f1.b = f2.b \
+         JOIN users u ON u.uuid = f1.b \
+         WHERE f1.a = ?1 AND f2.a = ?2",
+    ) else {
+        return None;
+    };
+    let rows = stmt
+        .query_map(
+            rusqlite::params![host.to_string(), guest.to_string()],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .ok()?;
+    for row in rows.flatten() {
+        if let Ok(u) = Uuid::parse_str(&row.0) {
+            if active_players.contains(&u) {
+                return Some((u, row.1));
+            }
+        }
+    }
+    None
+}
+
+/// Strictly 2-hop friends-of-friends of `host` (excluding `host` and direct friends)
+/// reachable ONLY through a mutual friend who is currently inside `active_players`.
+/// Returns `fof_uuid -> active_mutual_friend_name`.
+pub fn friends_of_friends_via_players(
+    conn: &Connection,
+    host: &Uuid,
+    active_players: &HashSet<Uuid>,
+) -> std::collections::HashMap<Uuid, String> {
+    let mut out = std::collections::HashMap::new();
+    if active_players.is_empty() {
+        return out;
+    }
+    let direct_friends = friends_with_names(conn, host);
+    let direct_set: HashSet<Uuid> = direct_friends.iter().map(|(u, _)| *u).collect();
+    for (mutual_uuid, mutual_name) in direct_friends {
+        if !active_players.contains(&mutual_uuid) {
+            continue;
+        }
+        for fof_uuid in friend_uuids(conn, &mutual_uuid) {
+            if fof_uuid == *host || direct_set.contains(&fof_uuid) {
+                continue;
+            }
+            out.entry(fof_uuid).or_insert_with(|| mutual_name.clone());
+        }
+    }
+    out
+}
+
 /// Strictly 2-hop friends-of-friends of `me` (excluding `me` and direct friends).
 /// Returns `(fof_uuid, via_mutual_friend_name)`.
+#[allow(dead_code)]
 pub fn friends_of_friends(conn: &Connection, me: &Uuid) -> Vec<(Uuid, String)> {
     request_rows(
         conn,
@@ -177,8 +244,7 @@ pub fn friends_of_friends(conn: &Connection, me: &Uuid) -> Vec<(Uuid, String)> {
 }
 
 /// All users reachable from `me` through any chain of friendships (excluding `me`).
-/// Uses a recursive SQLite CTE with `UNION` deduplication so cycles terminate
-/// cleanly and disconnected strangers are never included.
+#[allow(dead_code)]
 pub fn friend_network(conn: &Connection, me: &Uuid) -> HashSet<Uuid> {
     let Ok(mut stmt) = conn.prepare(
         "WITH RECURSIVE net(uuid) AS ( \
@@ -201,6 +267,7 @@ pub fn friend_network(conn: &Connection, me: &Uuid) -> HashSet<Uuid> {
 }
 
 /// Returns true iff `b` is reachable from `a` along any chain of friendships.
+#[allow(dead_code)]
 pub fn in_friend_network(conn: &Connection, a: &Uuid, b: &Uuid) -> bool {
     if a == b {
         return false;
@@ -461,5 +528,56 @@ mod tests {
 
         assert!(in_friend_network(&conn, &a, &d));
         assert!(!in_friend_network(&conn, &a, &stranger));
+    }
+
+    #[test]
+    fn live_fof_requires_mutual_friend_in_world() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users(uuid TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE, created_at INTEGER NOT NULL);
+             CREATE TABLE friendships(a TEXT NOT NULL, b TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY(a, b));",
+        )
+        .unwrap();
+
+        let host = Uuid::new_v4();
+        let alice = Uuid::new_v4();
+        let bob = Uuid::new_v4();
+        let charlie = Uuid::new_v4();
+        upsert_user(&mut conn, host, "Host").unwrap();
+        upsert_user(&mut conn, alice, "Alice").unwrap();
+        upsert_user(&mut conn, bob, "Bob").unwrap();
+        upsert_user(&mut conn, charlie, "Charlie").unwrap();
+
+        // host <-> alice <-> bob <-> charlie
+        add_friendship(&conn, &host, &alice);
+        add_friendship(&conn, &alice, &bob);
+        add_friendship(&conn, &bob, &charlie);
+
+        // When only host is in the world, bob cannot join via FoF.
+        let mut in_world = HashSet::from([host]);
+        assert!(mutual_friend_in_set(&conn, &host, &bob, &in_world).is_none());
+        assert!(friends_of_friends_via_players(&conn, &host, &in_world).is_empty());
+
+        // When alice joins, bob CAN see/join via Alice, but charlie STILL cannot!
+        in_world.insert(alice);
+        assert_eq!(
+            mutual_friend_in_set(&conn, &host, &bob, &in_world),
+            Some((alice, "Alice".into()))
+        );
+        let fof = friends_of_friends_via_players(&conn, &host, &in_world);
+        assert_eq!(fof.get(&bob).map(String::as_str), Some("Alice"));
+        assert!(!fof.contains_key(&charlie));
+        assert!(!fof.contains_key(&alice));
+
+        // Even when bob joins, charlie STILL cannot join (strictly host -> alice -> bob, not 3-hop).
+        in_world.insert(bob);
+        assert!(mutual_friend_in_set(&conn, &host, &charlie, &in_world).is_none());
+        let fof2 = friends_of_friends_via_players(&conn, &host, &in_world);
+        assert!(!fof2.contains_key(&charlie));
+
+        // When alice leaves, bob is no longer reachable via live FoF.
+        in_world.remove(&alice);
+        assert!(mutual_friend_in_set(&conn, &host, &bob, &in_world).is_none());
+        assert!(friends_of_friends_via_players(&conn, &host, &in_world).is_empty());
     }
 }

@@ -19,15 +19,14 @@ pub enum AccessMode {
     InviteOnly,
     Friends,
     FriendsOfFriends,
-    Open,
 }
 
 impl AccessMode {
     pub fn parse(s: &str) -> Self {
         match s {
             "invite_only" => Self::InviteOnly,
-            "friends_of_friends" => Self::FriendsOfFriends,
-            "open" => Self::Open,
+            // Legacy "open" (former Friend Network) safely falls back to FriendsOfFriends.
+            "friends_of_friends" | "open" => Self::FriendsOfFriends,
             _ => Self::Friends,
         }
     }
@@ -37,7 +36,6 @@ impl AccessMode {
             Self::InviteOnly => "invite_only",
             Self::Friends => "friends",
             Self::FriendsOfFriends => "friends_of_friends",
-            Self::Open => "open",
         }
     }
 }
@@ -68,6 +66,7 @@ impl InvitePerm {
 }
 
 const INVITE_TTL_SECS: i64 = 30;
+const FOF_RECONNECT_GRACE_SECS: i64 = 120;
 const AUTH_CHALLENGE_TTL_SECS: i64 = 30;
 const AUTH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(45);
 const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
@@ -93,6 +92,13 @@ pub struct HostedSession {
     /// Players who have already opened a game join room for this session
     /// (allowed to open/reconnect auxiliary voice tunnels even if world fills/locks).
     pub active_joiners: HashSet<Uuid>,
+    /// Live set of player UUIDs currently inside the hosted world (reported by host).
+    pub current_players: HashSet<Uuid>,
+    /// Short reconnect grace window (2 minutes) for players who were already in
+    /// the world and disconnected (e.g. FoF guest whose mutual friend already left).
+    pub grace_joiners: HashMap<Uuid, i64>,
+    /// Optional 6-character uppercase alphanumeric (A-Z, 0-9) join code (off by default).
+    pub join_code: Option<String>,
 }
 
 impl HostedSession {
@@ -104,6 +110,16 @@ impl HostedSession {
     pub fn prune_expired_invites(&mut self) {
         let now = db::now();
         self.invites.retain(|_, (_, _, exp)| *exp > now);
+    }
+
+    pub fn has_reconnect_grace(&self, uuid: &Uuid) -> bool {
+        let now = db::now();
+        self.grace_joiners.get(uuid).is_some_and(|exp| *exp > now)
+    }
+
+    pub fn prune_expired_grace(&mut self) {
+        let now = db::now();
+        self.grace_joiners.retain(|_, exp| *exp > now);
     }
 }
 
@@ -328,6 +344,14 @@ async fn handle_message(
             Some(me) => session_invite(app, me, tx, v).await,
             None => send(tx, error_op("say hello first")).await,
         },
+        "session.code" => match identity {
+            Some(me) => session_code(app, me, tx, v).await,
+            None => send(tx, error_op("say hello first")).await,
+        },
+        "code.lookup" => match identity {
+            Some(me) => code_lookup(app, me, tx, v).await,
+            None => send(tx, error_op("say hello first")).await,
+        },
         "presence.update" => match identity {
             Some(me) => presence_update(app, me, v).await,
             None => send(tx, error_op("say hello first")).await,
@@ -342,6 +366,10 @@ async fn handle_message(
         },
         "join.begin" => match identity {
             Some(me) => join_begin(app, me, tx, v).await,
+            None => send(tx, error_op("say hello first")).await,
+        },
+        "join.code" => match identity {
+            Some(me) => join_code(app, me, tx, v).await,
             None => send(tx, error_op("say hello first")).await,
         },
         other => send(tx, error_op(format!("unknown op '{other}'"))).await,
@@ -549,21 +577,19 @@ fn visible_to_friend(session: &HostedSession, viewer: &Uuid) -> bool {
 
 /// Build the friends.sync payload for one user: friends (with live
 /// presence), incoming requests, outgoing requests, and discoverable
-/// non-friend worlds (friends-of-friends, open, or explicit invites).
+/// non-friend worlds (live friends-of-friends or explicit invites).
 async fn build_sync(app: &App, me: &Uuid) -> String {
-    let (friend_pairs, fof_pairs, incoming, outgoing) = {
+    let (friend_pairs, incoming, outgoing) = {
         let conn = app.db.lock().unwrap();
         let friends = db::friends_with_names(&conn, me);
-        let fof = db::friends_of_friends(&conn, me);
         let incoming = db::incoming_requests(&conn, me);
         let outgoing = db::outgoing_requests(&conn, me);
-        (friends, fof, incoming, outgoing)
+        (friends, incoming, outgoing)
     };
 
     let sessions: HashMap<Uuid, HostedSession> = app.sessions.lock().await.clone();
     let activities: HashMap<Uuid, ClientActivity> = app.activities.lock().await.clone();
     let friend_set: HashSet<Uuid> = friend_pairs.iter().map(|(u, _)| *u).collect();
-    let fof_map: HashMap<Uuid, String> = fof_pairs.into_iter().collect();
 
     let mut friends: Vec<Value> = Vec::new();
     for (u, name) in &friend_pairs {
@@ -592,16 +618,9 @@ async fn build_sync(app: &App, me: &Uuid) -> String {
         }));
     }
 
-    // Non-friend sessions this user can see & join (invited, FOF, or Friend Network).
-    let has_open_session = sessions
-        .iter()
-        .any(|(h, s)| h != me && !friend_set.contains(h) && s.access == AccessMode::Open);
-    let network_set: HashSet<Uuid> = if has_open_session {
-        let conn = app.db.lock().unwrap();
-        db::friend_network(&conn, me)
-    } else {
-        HashSet::new()
-    };
+    // Non-friend sessions this user can see & join (explicit invite, or
+    // Friends-of-Friends where a mutual friend is currently in the world, or
+    // within the 2-minute reconnect grace window).
     let mut discoverable: Vec<Value> = Vec::new();
     for (host_uuid, sess) in &sessions {
         if host_uuid == me || friend_set.contains(host_uuid) || sess.banned.contains(me) {
@@ -610,14 +629,14 @@ async fn build_sync(app: &App, me: &Uuid) -> String {
         let via = if let Some((_, inviter_name, _)) = sess.active_invite(me) {
             Some(("invite", inviter_name.clone()))
         } else if sess.access == AccessMode::FriendsOfFriends {
-            fof_map
-                .get(host_uuid)
-                .map(|via_name| ("friend_of_friend", via_name.clone()))
-        } else if sess.access == AccessMode::Open {
-            if let Some(via_name) = fof_map.get(host_uuid) {
-                Some(("friend_of_friend", via_name.clone()))
-            } else if network_set.contains(host_uuid) {
-                Some(("open", String::new()))
+            let active_mutual = {
+                let conn = app.db.lock().unwrap();
+                db::mutual_friend_in_set(&conn, host_uuid, me, &sess.current_players)
+            };
+            if let Some((_, via_name)) = active_mutual {
+                Some(("friend_of_friend", via_name))
+            } else if sess.has_reconnect_grace(me) {
+                Some(("friend_of_friend", String::new()))
             } else {
                 None
             }
@@ -700,9 +719,20 @@ async fn friend_add(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
             db::add_friendship(&conn, &target_uuid, me);
             db::log_event(&conn, "friend_added", None);
         }
+        let my_name = resolve_user_name(app, me).await;
         send(tx, build_sync(app, me).await).await;
         if let Some(other) = app.hub.tx(&target_uuid).await {
             send(&other, build_sync(app, &target_uuid).await).await;
+            send(
+                &other,
+                json!({
+                    "op": "friend.accepted",
+                    "uuid": me.to_string(),
+                    "name": my_name,
+                })
+                .to_string(),
+            )
+            .await;
         }
         push_presence_to_friends(app, me).await;
         return;
@@ -755,9 +785,20 @@ async fn friend_accept(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
         db::add_friendship(&conn, &requester, me);
         db::log_event(&conn, "friend_added", None);
     }
+    let my_name = resolve_user_name(app, me).await;
     send(tx, build_sync(app, me).await).await;
     if let Some(other) = app.hub.tx(&requester).await {
         send(&other, build_sync(app, &requester).await).await;
+        send(
+            &other,
+            json!({
+                "op": "friend.accepted",
+                "uuid": me.to_string(),
+                "name": my_name,
+            })
+            .to_string(),
+        )
+        .await;
     }
     push_presence_to_friends(app, me).await;
 }
@@ -805,7 +846,49 @@ fn parse_uuid_set(v: &Value, key: &str) -> Option<HashSet<Uuid>> {
     )
 }
 
-fn apply_session_fields(sess: &mut HostedSession, v: &Value) {
+pub(crate) async fn resolve_user_name(app: &App, uuid: &Uuid) -> String {
+    match app.hub.name(uuid).await {
+        Some(n) => n,
+        None => {
+            let conn = app.db.lock().unwrap();
+            db::user_name_by_uuid(&conn, uuid).unwrap_or_else(|| "?".into())
+        }
+    }
+}
+
+pub(crate) fn normalize_join_code(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    if cleaned.len() == 6 {
+        Some(cleaned)
+    } else {
+        None
+    }
+}
+
+fn generate_join_code(sessions: &HashMap<Uuid, HostedSession>) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    loop {
+        let bytes = Uuid::new_v4();
+        let raw = bytes.as_bytes();
+        let mut code = String::with_capacity(6);
+        for i in 0..6 {
+            let idx = (raw[i] as usize) % ALPHABET.len();
+            code.push(ALPHABET[idx] as char);
+        }
+        let collision = sessions
+            .values()
+            .any(|s| s.join_code.as_deref() == Some(code.as_str()));
+        if !collision {
+            return code;
+        }
+    }
+}
+
+fn apply_session_fields(sess: &mut HostedSession, host: &Uuid, v: &Value) {
     if let Some(world) = v.get("worldName").and_then(Value::as_str) {
         if !world.is_empty() {
             sess.world_name = world.to_string();
@@ -838,26 +921,55 @@ fn apply_session_fields(sess: &mut HostedSession, v: &Value) {
     if let Some(banned) = parse_uuid_set(v, "banned") {
         sess.banned = banned;
     }
+    if let Some(mut players) = parse_uuid_set(v, "players") {
+        players.insert(*host);
+        let now = db::now();
+        // Grant a 2-minute reconnect grace window to any guest who just disconnected
+        // from the world (so a FoF guest whose mutual friend already left can reconnect
+        // briefly after a crash/network blip).
+        for prev_player in &sess.current_players {
+            if prev_player != host && !players.contains(prev_player) && !sess.banned.contains(prev_player) {
+                sess.grace_joiners
+                    .insert(*prev_player, now + FOF_RECONNECT_GRACE_SECS);
+            }
+        }
+        // Clear grace entries for players currently back inside or banned.
+        for p in &players {
+            sess.grace_joiners.remove(p);
+        }
+        sess.grace_joiners.retain(|u, exp| *exp > now && !sess.banned.contains(u));
+        sess.current_players = players;
+    } else {
+        sess.current_players.insert(*host);
+        sess.prune_expired_grace();
+    }
 }
 
 async fn session_open(app: &Arc<App>, me: &Uuid, _tx: &Tx, v: &Value) {
     let prev = {
         let mut sessions = app.sessions.lock().await;
         let prev = sessions.get(me).cloned();
-        let mut sess = prev.clone().unwrap_or_else(|| HostedSession {
-            world_name: "a world".into(),
-            game_version: String::new(),
-            access: AccessMode::Friends,
-            invite_perm: InvitePerm::HostOnly,
-            locked: false,
-            max_players: 8,
-            player_count: 1,
-            invites: HashMap::new(),
-            operators: HashSet::new(),
-            banned: HashSet::new(),
-            active_joiners: HashSet::new(),
+        let mut sess = prev.clone().unwrap_or_else(|| {
+            let mut initial_players = HashSet::new();
+            initial_players.insert(*me);
+            HostedSession {
+                world_name: "a world".into(),
+                game_version: String::new(),
+                access: AccessMode::Friends,
+                invite_perm: InvitePerm::HostOnly,
+                locked: false,
+                max_players: 8,
+                player_count: 1,
+                invites: HashMap::new(),
+                operators: HashSet::new(),
+                banned: HashSet::new(),
+                active_joiners: HashSet::new(),
+                current_players: initial_players,
+                grace_joiners: HashMap::new(),
+                join_code: None,
+            }
         });
-        apply_session_fields(&mut sess, v);
+        apply_session_fields(&mut sess, me, v);
         sessions.insert(*me, sess);
         prev
     };
@@ -876,10 +988,214 @@ async fn session_update(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
             return;
         };
         let prev = existing.clone();
-        apply_session_fields(existing, v);
+        apply_session_fields(existing, me, v);
         prev
     };
     push_session_state(app, me, Some(&prev)).await;
+}
+
+async fn session_code(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
+    let action = v.get("action").and_then(Value::as_str).unwrap_or("generate");
+    let code_result: Result<Option<String>, &'static str> = {
+        let mut sessions = app.sessions.lock().await;
+        if !sessions.contains_key(me) {
+            Err("start hosting before generating a join code")
+        } else {
+            let next_code = match action {
+                "disable" | "off" | "clear" => None,
+                "regenerate" => Some(generate_join_code(&sessions)),
+                _ => {
+                    if let Some(existing) = sessions.get(me).and_then(|s| s.join_code.clone()) {
+                        Some(existing)
+                    } else {
+                        Some(generate_join_code(&sessions))
+                    }
+                }
+            };
+            if let Some(sess) = sessions.get_mut(me) {
+                sess.join_code = next_code.clone();
+            }
+            Ok(next_code)
+        }
+    };
+    match code_result {
+        Ok(code) => {
+            send(
+                tx,
+                json!({
+                    "op": "session.code.state",
+                    "code": code.as_deref().unwrap_or(""),
+                    "enabled": code.is_some(),
+                })
+                .to_string(),
+            )
+            .await;
+        }
+        Err(msg) => {
+            send(tx, error_op(msg)).await;
+        }
+    }
+}
+
+async fn code_lookup(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
+    let raw = v.get("code").and_then(Value::as_str).unwrap_or("");
+    let Some(code) = normalize_join_code(raw) else {
+        send(
+            tx,
+            json!({
+                "op": "code.info",
+                "code": raw.trim().to_uppercase(),
+                "found": false,
+                "error": "Enter a 6-character join code",
+            })
+            .to_string(),
+        )
+        .await;
+        return;
+    };
+
+    let matched = {
+        let sessions = app.sessions.lock().await;
+        sessions
+            .iter()
+            .find(|(_, s)| s.join_code.as_deref() == Some(code.as_str()))
+            .map(|(h, s)| (*h, s.clone()))
+    };
+
+    let Some((host_uuid, sess)) = matched else {
+        send(
+            tx,
+            json!({
+                "op": "code.info",
+                "code": code,
+                "found": false,
+                "error": "No world found for that code",
+            })
+            .to_string(),
+        )
+        .await;
+        return;
+    };
+
+    if sess.banned.contains(me) {
+        send(
+            tx,
+            json!({
+                "op": "code.info",
+                "code": code,
+                "found": false,
+                "error": "You are banned from this world",
+            })
+            .to_string(),
+        )
+        .await;
+        return;
+    }
+
+    let host_name = resolve_user_name(app, &host_uuid).await;
+    send(
+        tx,
+        json!({
+            "op": "code.info",
+            "code": code,
+            "found": true,
+            "host": host_uuid.to_string(),
+            "hostName": host_name,
+            "worldName": sess.world_name,
+            "gameVersion": sess.game_version,
+            "playerCount": sess.player_count,
+            "maxPlayers": sess.max_players,
+            "locked": sess.locked,
+            "isSelf": host_uuid == *me,
+        })
+        .to_string(),
+    )
+    .await;
+}
+
+async fn join_code(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
+    let raw = v.get("code").and_then(Value::as_str).unwrap_or("");
+    let Some(code) = normalize_join_code(raw) else {
+        send(tx, error_op("enter a valid 6-character join code")).await;
+        return;
+    };
+    let matched = {
+        let sessions = app.sessions.lock().await;
+        sessions
+            .iter()
+            .find(|(_, s)| s.join_code.as_deref() == Some(code.as_str()))
+            .map(|(h, s)| (*h, s.clone()))
+    };
+    let Some((host, sess)) = matched else {
+        send(tx, error_op("invalid or expired join code")).await;
+        return;
+    };
+    if host == *me {
+        send(tx, error_op("that's your own world")).await;
+        return;
+    }
+    let Some(host_tx) = app.hub.tx(&host).await else {
+        send(tx, error_op("that host is not online")).await;
+        return;
+    };
+    if sess.banned.contains(me) {
+        send(tx, error_op("you are banned from this world")).await;
+        return;
+    }
+    if sess.locked {
+        send(tx, error_op("this world is currently locked")).await;
+        return;
+    }
+    if sess.player_count >= sess.max_players {
+        send(tx, error_op("this world is full")).await;
+        return;
+    }
+
+    let host_name = resolve_user_name(app, &host).await;
+    let joiner_name = resolve_user_name(app, me).await;
+    let Some((room_id, host_token, joiner_token)) = app.relay.create_room(app, host, *me) else {
+        send(tx, error_op("that host has too many active connections right now")).await;
+        return;
+    };
+
+    if let Some(live) = app.sessions.lock().await.get_mut(&host) {
+        live.active_joiners.insert(*me);
+    }
+    {
+        let conn = app.db.lock().unwrap();
+        db::log_event(&conn, "join_begin", None);
+    }
+
+    send(
+        tx,
+        json!({
+            "op": "join.ready",
+            "host": host.to_string(),
+            "hostName": host_name,
+            "worldName": sess.world_name,
+            "gameVersion": sess.game_version,
+            "roomId": room_id.to_string(),
+            "token": joiner_token,
+            "relayPath": "/relay/ws"
+        })
+        .to_string(),
+    )
+    .await;
+    send(
+        &host_tx,
+        json!({
+            "op": "relay.host",
+            "roomId": room_id.to_string(),
+            "token": host_token,
+            "relayPath": "/relay/ws",
+            "joinerUuid": me.to_string(),
+            "joinerName": joiner_name,
+            "joinSource": "code",
+            "viaName": "",
+        })
+        .to_string(),
+    )
+    .await;
 }
 
 async fn session_close(app: &Arc<App>, me: &Uuid) {
@@ -1025,20 +1341,15 @@ async fn join_begin(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
     let (join_source, via_name): (&str, String) = if already_joined {
         ("voice", String::new())
     } else {
-        let (direct_friend, mutual, in_network) = {
+        let (direct_friend, active_mutual) = {
             let conn = app.db.lock().unwrap();
             let direct = db::are_friends(&conn, me, &host);
             let mutual = if direct {
                 None
             } else {
-                db::mutual_friend(&conn, &host, me)
+                db::mutual_friend_in_set(&conn, &host, me, &sess.current_players)
             };
-            let in_net = if direct || mutual.is_some() || sess.access != AccessMode::Open {
-                direct || mutual.is_some()
-            } else {
-                db::in_friend_network(&conn, &host, me)
-            };
-            (direct, mutual, in_net)
+            (direct, mutual)
         };
 
         let invite_info = sess.active_invite(me).cloned();
@@ -1060,22 +1371,16 @@ async fn join_begin(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
                 AccessMode::FriendsOfFriends => {
                     if direct_friend {
                         ("friend", String::new())
-                    } else if let Some((_, mutual_name)) = mutual {
+                    } else if let Some((_, mutual_name)) = active_mutual {
                         ("friend_of_friend", mutual_name)
+                    } else if sess.has_reconnect_grace(me) {
+                        ("friend_of_friend", String::new())
                     } else {
-                        send(tx, error_op("this world is limited to friends of friends")).await;
-                        return;
-                    }
-                }
-                AccessMode::Open => {
-                    if direct_friend {
-                        ("friend", String::new())
-                    } else if let Some((_, mutual_name)) = mutual {
-                        ("friend_of_friend", mutual_name)
-                    } else if in_network {
-                        ("open", String::new())
-                    } else {
-                        send(tx, error_op("this world is limited to the host's friend network")).await;
+                        send(
+                            tx,
+                            error_op("a mutual friend must currently be in this world to join"),
+                        )
+                        .await;
                         return;
                     }
                 }
@@ -1083,13 +1388,8 @@ async fn join_begin(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
         }
     };
 
-    let joiner_name = match app.hub.name(me).await {
-        Some(n) => n,
-        None => {
-            let conn = app.db.lock().unwrap();
-            db::user_name_by_uuid(&conn, me).unwrap_or_else(|| "?".into())
-        }
-    };
+    let host_name = resolve_user_name(app, &host).await;
+    let joiner_name = resolve_user_name(app, me).await;
 
     let Some((room_id, host_token, joiner_token)) = app.relay.create_room(app, host, *me) else {
         send(tx, error_op("that host has too many active connections right now")).await;
@@ -1142,7 +1442,9 @@ async fn join_begin(app: &Arc<App>, me: &Uuid, tx: &Tx, v: &Value) {
         json!({
             "op": "join.ready",
             "host": host.to_string(),
+            "hostName": host_name,
             "worldName": sess.world_name,
+            "gameVersion": sess.game_version,
             "roomId": room_id.to_string(),
             "token": joiner_token,
             "relayPath": "/relay/ws"
@@ -1332,45 +1634,43 @@ async fn push_presence_to_friends(app: &Arc<App>, me: &Uuid) {
 }
 
 async fn push_session_state(app: &Arc<App>, me: &Uuid, prev: Option<&HostedSession>) {
-    let (friends, fof_pairs, host_name) = {
+    let curr = app.sessions.lock().await.get(me).cloned();
+    let (friends, prev_fof_map, curr_fof_map, host_name) = {
         let conn = app.db.lock().unwrap();
         let friends = db::friend_uuids(&conn, me);
-        let fof = db::friends_of_friends(&conn, me);
+        let prev_fof = match prev {
+            Some(p) if p.access == AccessMode::FriendsOfFriends => {
+                db::friends_of_friends_via_players(&conn, me, &p.current_players)
+            }
+            _ => HashMap::new(),
+        };
+        let curr_fof = match &curr {
+            Some(c) if c.access == AccessMode::FriendsOfFriends => {
+                db::friends_of_friends_via_players(&conn, me, &c.current_players)
+            }
+            _ => HashMap::new(),
+        };
         let name = db::user_name_by_uuid(&conn, me);
-        (friends, fof, name)
+        (friends, prev_fof, curr_fof, name)
     };
     let host_name = match app.hub.name(me).await {
         Some(n) => n,
         None => host_name.unwrap_or_else(|| "?".into()),
     };
-    let curr = app.sessions.lock().await.get(me).cloned();
     let friend_set: HashSet<Uuid> = friends.iter().copied().collect();
-    let fof_map: HashMap<Uuid, String> = fof_pairs.into_iter().collect();
 
-    // Determine who should receive an update: all friends, plus FOF / invitees /
-    // online users if either the previous or current session reached them.
+    // Determine who should receive an update: all friends, plus anyone reachable
+    // via live FoF, reconnect grace, or invites in either the previous or current state.
     let mut recipients: HashSet<Uuid> = friends.into_iter().collect();
-    let involves_fof = prev.is_some_and(|s| s.access == AccessMode::FriendsOfFriends)
-        || curr.as_ref().is_some_and(|s| s.access == AccessMode::FriendsOfFriends);
-    let involves_open = prev.is_some_and(|s| s.access == AccessMode::Open)
-        || curr.as_ref().is_some_and(|s| s.access == AccessMode::Open);
-    let network_set: HashSet<Uuid> = if involves_open {
-        let conn = app.db.lock().unwrap();
-        db::friend_network(&conn, me)
-    } else {
-        HashSet::new()
-    };
-    if involves_fof {
-        recipients.extend(fof_map.keys().copied());
-    }
-    if involves_open {
-        recipients.extend(network_set.iter().copied());
-    }
+    recipients.extend(prev_fof_map.keys().copied());
+    recipients.extend(curr_fof_map.keys().copied());
     if let Some(p) = prev {
         recipients.extend(p.invites.keys().copied());
+        recipients.extend(p.grace_joiners.keys().copied());
     }
     if let Some(c) = &curr {
         recipients.extend(c.invites.keys().copied());
+        recipients.extend(c.grace_joiners.keys().copied());
     }
     recipients.insert(*me);
 
@@ -1395,19 +1695,10 @@ async fn push_session_state(app: &Arc<App>, me: &Uuid, prev: Option<&HostedSessi
                 AccessMode::FriendsOfFriends => {
                     if is_friend {
                         (true, "friend", String::new())
-                    } else if let Some(via) = fof_map.get(&recipient) {
+                    } else if let Some(via) = curr_fof_map.get(&recipient) {
                         (true, "friend_of_friend", via.clone())
-                    } else {
-                        (false, "", String::new())
-                    }
-                }
-                AccessMode::Open => {
-                    if is_friend {
-                        (true, "friend", String::new())
-                    } else if let Some(via) = fof_map.get(&recipient) {
-                        (true, "friend_of_friend", via.clone())
-                    } else if network_set.contains(&recipient) {
-                        (true, "open", String::new())
+                    } else if s.has_reconnect_grace(&recipient) {
+                        (true, "friend_of_friend", String::new())
                     } else {
                         (false, "", String::new())
                     }

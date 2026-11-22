@@ -8,9 +8,12 @@ services:
       # If using Cloudflare Tunnel only, you can switch this to
       # "127.0.0.1:8787:8787" or remove ports entirely.
       - "${BURROW_PORT:-8787}:8787"
+      # Vanilla Minecraft join-code ingress (<CODE>.burrow.meeyah.dev:25565).
+      - "${BURROW_TCP_PORT:-25565}:25565"
     volumes:
       - burrow-data:/data
     environment:
+      BURROW_TCP_BIND: "${BURROW_TCP_BIND:-0.0.0.0:25565}"
       BURROW_DEV_MODE: "${BURROW_DEV_MODE:-0}"
       BURROW_ADMIN_TOKEN: "${BURROW_ADMIN_TOKEN:-}"
       BURROW_DISCORD_CLIENT_ID: "${BURROW_DISCORD_CLIENT_ID:-}"

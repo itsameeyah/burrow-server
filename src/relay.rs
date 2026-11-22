@@ -79,6 +79,48 @@ impl Relay {
         tokio::spawn(broker(app.clone(), room_id, host_rx, joiner_rx, host_guard));
         Some((room_id, host_token, joiner_token))
     }
+
+    /// Create a host-only relay room bridged directly to a raw vanilla Minecraft
+    /// TCP connection (for non-Burrow players connecting via `<CODE>.<domain>`).
+    pub fn create_tcp_room(
+        &self,
+        app: &Arc<App>,
+        host: Uuid,
+        tcp: tokio::net::TcpStream,
+        initial_bytes: Vec<u8>,
+    ) -> Option<(Uuid, String)> {
+        {
+            let mut counts = self.host_counts.lock().unwrap();
+            let count = counts.entry(host).or_insert(0);
+            if *count >= MAX_ROOMS_PER_HOST {
+                return None;
+            }
+            *count += 1;
+        }
+
+        let host_guard = HostRoomGuard { app: app.clone(), host };
+        let room_id = Uuid::new_v4();
+        let host_token = Uuid::new_v4().to_string();
+        let (host_tx, host_rx) = oneshot::channel::<WebSocket>();
+        self.rooms.lock().unwrap().insert(
+            room_id,
+            Room {
+                host: Some(host_tx),
+                joiner: None,
+                host_token: host_token.clone(),
+                joiner_token: String::new(),
+            },
+        );
+        tokio::spawn(broker_tcp(
+            app.clone(),
+            room_id,
+            host_rx,
+            tcp,
+            initial_bytes,
+            host_guard,
+        ));
+        Some((room_id, host_token))
+    }
 }
 
 struct HostRoomGuard {
@@ -155,6 +197,46 @@ async fn broker(
     }
 }
 
+async fn broker_tcp(
+    app: Arc<App>,
+    room_id: Uuid,
+    host_rx: oneshot::Receiver<WebSocket>,
+    tcp: tokio::net::TcpStream,
+    initial_bytes: Vec<u8>,
+    _host_guard: HostRoomGuard,
+) {
+    let paired = tokio::time::timeout(Duration::from_secs(20), host_rx)
+        .await
+        .ok()
+        .and_then(|r| r.ok());
+
+    app.relay.rooms.lock().unwrap().remove(&room_id);
+
+    match paired {
+        Some(host) => {
+            let _guard = ActiveTunnelGuard::enter(app.clone());
+            {
+                let conn = app.db.lock().unwrap();
+                db::log_event(&conn, "relay_open", None);
+            }
+            tracing::info!("tcp relay room {room_id} paired, splicing");
+            splice_ws_tcp(host, tcp, initial_bytes).await;
+            {
+                let conn = app.db.lock().unwrap();
+                db::log_event(&conn, "relay_close", None);
+            }
+            tracing::info!("tcp relay room {room_id} closed");
+        }
+        None => {
+            {
+                let conn = app.db.lock().unwrap();
+                db::log_event(&conn, "relay_expired", None);
+            }
+            tracing::info!("tcp relay room {room_id} expired waiting for host");
+        }
+    }
+}
+
 /// Forward binary frames both directions until either side closes.
 async fn splice(a: WebSocket, b: WebSocket) {
     let (mut a_sink, mut a_stream) = a.split();
@@ -201,6 +283,59 @@ async fn splice(a: WebSocket, b: WebSocket) {
     tokio::select! {
         _ = &mut a_to_b => { b_to_a.abort(); }
         _ = &mut b_to_a => { a_to_b.abort(); }
+    }
+}
+
+/// Splice a host WebSocket relay with a raw vanilla Minecraft TCP stream.
+async fn splice_ws_tcp(ws: WebSocket, tcp: tokio::net::TcpStream, initial_bytes: Vec<u8>) {
+    use futures_util::SinkExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let _ = tcp.set_nodelay(true);
+    let (mut ws_sink, mut ws_stream) = ws.split();
+    let (mut tcp_read, mut tcp_write) = tcp.into_split();
+
+    if !initial_bytes.is_empty() && ws_sink.send(Message::Binary(initial_bytes.into())).await.is_err() {
+        return;
+    }
+
+    let mut tcp_to_ws = tokio::spawn(async move {
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            match tcp_read.read(&mut buf).await {
+                Ok(0) | Err(_) => {
+                    let _ = ws_sink.send(Message::Close(None)).await;
+                    break;
+                }
+                Ok(n) => {
+                    if ws_sink.send(Message::Binary(buf[..n].to_vec().into())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut ws_to_tcp = tokio::spawn(async move {
+        while let Some(Ok(msg)) = ws_stream.next().await {
+            match msg {
+                Message::Binary(data) => {
+                    if tcp_write.write_all(&data).await.is_err() {
+                        break;
+                    }
+                }
+                Message::Close(_) => {
+                    let _ = tcp_write.shutdown().await;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+
+    tokio::select! {
+        _ = &mut tcp_to_ws => { ws_to_tcp.abort(); }
+        _ = &mut ws_to_tcp => { tcp_to_ws.abort(); }
     }
 }
 

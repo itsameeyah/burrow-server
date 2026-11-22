@@ -3,6 +3,7 @@ mod dashboard;
 mod hub;
 mod relay;
 mod stats;
+mod tcp_ingress;
 mod ws;
 
 use std::path::PathBuf;
@@ -13,6 +14,10 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let bind = std::env::var("BURROW_BIND").unwrap_or_else(|_| "0.0.0.0:8787".into());
+    let tcp_bind = std::env::var("BURROW_TCP_BIND")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let db_path = std::env::var("BURROW_DB").unwrap_or_else(|_| "burrow.db".into());
     let dev_mode = std::env::var("BURROW_DEV_MODE")
         .map(|v| matches!(v.trim(), "1" | "true"))
@@ -46,6 +51,10 @@ async fn main() {
         oauth_states: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         http: reqwest::Client::new(),
     });
+
+    if let Some(tb) = tcp_bind {
+        tokio::spawn(tcp_ingress::serve(app.clone(), tb));
+    }
 
     let router = axum::Router::new()
         .route("/ws", axum::routing::get(ws::ws_handler))
